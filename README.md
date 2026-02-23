@@ -145,11 +145,17 @@ generation:
 
 You can use GitHub Copilot's underlying LLMs (like GPT-4o) as the brain for CaseCraft. Configure your `casecraft.yaml` to use the GitHub Models API (which is OpenAI compatible):
 
+
+```bash
+# Install OpenAI dependency
+pip install openai
+```
+
 ```yaml
 general:
   llm_provider: "openai"
-  model: "gpt-4o"
-  base_url: "https://api.githubcopilot.com"
+  model: "gpt-4.1-nano"
+  base_url: "https://models.github.ai/inference"
 ```
 
 *Note: You must set the environment variable `CASECRAFT_GENERAL_API_KEY` to your GitHub Personal Access Token (PAT) with Copilot access.*
