@@ -1,0 +1,79 @@
+# CaseCraft Configuration
+
+# --------------------------
+# General Settings
+# --------------------------
+general:
+  # The Ollama model to use for generation and condensation.
+  # Options:
+  # - "llama3.1:8b" (Balanced)
+  # - "qwen2.5:7b" (Best Casting/Coding capability)
+  # - "llama3.2:3b" (Fastest Local)
+  model: "llama3.1:8b"
+
+  # Backend provider: "ollama" (native), "openai" (compatible servers), or "google" (Gemini)
+  llm_provider: "ollama"
+  
+  # API Endpoint
+  # - Ollama: http://localhost:11434
+  # - OpenAI/vLLM/LocalAI: http://localhost:8000/v1
+  # - Google: https://generativelanguage.googleapis.com/v1beta
+  base_url: "http://localhost:11434"
+  
+  # API Key — NEVER put real keys here. Use env var CASECRAFT_GENERAL_API_KEY instead.
+  api_key: "ollama"  # Default for local Ollama (no real key needed)
+
+  # Context window size (num_ctx) — controls RAM usage.
+  # -1 = use model default (128K for llama3.2, needs ~16GB RAM!)
+  # 4096 = ~4GB RAM — safe for machines with 8-16GB.
+  # 8192 = ~6GB RAM — better for larger documents.
+  context_window_size: -1
+
+  # Maximum number of retries if the LLM generates invalid JSON.
+  max_retries: 2
+
+# --------------------------
+# Generation Parameters
+# --------------------------
+generation:
+  # Size of document chunks (in characters).
+  # Larger chunks = more context but potentially lost details.
+  # Smaller chunks = more focus but potentially missed cross-references.
+  chunk_size: 800
+  
+  # Overlap between chunks to maintain continuity.
+  chunk_overlap: 100
+  
+  # Creativity of the model (0.0 - 1.0).
+  # Lower values (0.1-0.2) are better for structured JSON output.
+  temperature: 0.2
+  
+  # The type of application being tested (web, mobile, desktop, api).
+  # This configures the specific types of test cases generated.
+  app_type: "web"
+
+# --------------------------
+# Output Settings
+# --------------------------
+output:
+  # Default output format: 'excel' or 'json'.
+  default_format: "excel"
+  
+  # Directory where outputs are saved by default.
+  output_dir: "outputs"
+
+# --------------------------
+# Quality & Performance
+# --------------------------
+quality:
+  # Enable semantic deduplication (removes similar test cases).
+  # Uses local embeddings (fast).
+  semantic_deduplication: true
+  
+  # Threshold for similarity (0.0 - 1.0).
+  # Higher = stricter (test cases must be nearly identical to remove).
+  similarity_threshold: 0.85
+  
+  # Enable the Reviewer Pass (slow).
+  # If true, an extra LLM call validates and polishes the test suite.
+  reviewer_pass: true

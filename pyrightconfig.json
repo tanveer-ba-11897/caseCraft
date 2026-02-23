@@ -1,0 +1,25 @@
+{
+    "include": [
+        "core",
+        "cli",
+        "tests",
+        "web"
+    ],
+    "exclude": [
+        "**/node_modules",
+        "**/__pycache__",
+        "venv-ingest",
+        "venv-runtime",
+        "knowledge_base"
+    ],
+    "ignore": [
+        "venv-ingest",
+        "venv-runtime"
+    ],
+    "reportMissingImports": true,
+    "executionEnvironments": [
+        {
+            "root": "."
+        }
+    ]
+}

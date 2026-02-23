@@ -1,0 +1,4 @@
+Login Feature
+The user must be able to log in using their email and password.
+If the password is correct, they are redirected to the dashboard.
+If incorrect, show "Invalid credentials".

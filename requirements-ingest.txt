@@ -1,0 +1,7 @@
+chromadb
+sentence-transformers
+numpy
+tqdm
+pypdf
+pdfplumber
+pydantic>=2.5,<3
