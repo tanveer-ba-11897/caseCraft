@@ -26,6 +26,7 @@ from core.knowledge.web_loader import (
 from core.knowledge.loader import load_documents
 from core.knowledge.chunker import chunk_document
 from core.knowledge.embedder import Embedder
+from core.config import load_config
 
 
 def _validate_index_path(index_path: str) -> str:
@@ -52,10 +53,15 @@ def ingest_to_index(documents, index_path: str = "knowledge_base/index.json"):
     
     print(f"[INFO] Processing {len(documents)} documents...")
     
+    # Load config for knowledge base chunk size
+    cfg = load_config()
+    kb_chunk_size = cfg.knowledge.kb_chunk_size
+    print(f"[INFO] Using knowledge base chunk size: {kb_chunk_size} chars")
+    
     # Chunk documents
     all_chunks = []
     for doc in documents:
-        chunks = chunk_document(doc)
+        chunks = chunk_document(doc, max_chars=kb_chunk_size)
         all_chunks.extend(chunks)
         print(f"[INFO] Chunked '{doc.source_name[:50]}...' into {len(chunks)} chunks")
     

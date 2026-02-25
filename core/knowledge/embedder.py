@@ -17,9 +17,9 @@ class Embedder:
     Handles embedding generation for knowledge chunks.
     """
 
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
+    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, model: SentenceTransformer = None):
         try:
-            self.model = SentenceTransformer(model_name)
+            self.model = model if model is not None else SentenceTransformer(model_name)
         except Exception as exc:
             raise EmbeddingError(
                 f"Failed to load embedding model: {model_name}"

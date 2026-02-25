@@ -1,5 +1,6 @@
-
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import numpy as np
@@ -10,6 +11,12 @@ from core.knowledge.retriever import KnowledgeRetriever
 from core.knowledge.embedder import Embedder
 from core.prompts import build_generation_prompt, build_condensation_prompt, build_reviewer_prompt
 from core.llm_client import llm_client
+
+# Precompiled regex patterns for _clean_json_output
+_THINK_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
+_CODE_BLOCK_PATTERN = re.compile(r'```(?:json)?(.*?)```', re.DOTALL)
+# Precompiled regex for _clean_test_case_titles
+_TITLE_PREFIX_PATTERN = re.compile(r'^(TC|Case|Test|Scenario|ID)\s*[-_#]?\s*\d+\s*[:\.\-]?\s*', re.IGNORECASE)
 
 
 class GenerationError(Exception):
@@ -23,28 +30,37 @@ _embedder = None
 def get_retriever():
     global _retriever
     if _retriever is None:
-        _retriever = KnowledgeRetriever()
+        from core.config import config
+        _retriever = KnowledgeRetriever(
+            min_score_threshold=config.knowledge.min_score_threshold,
+        )
     return _retriever
 
 def get_embedder():
     global _embedder
     if _embedder is None:
-        _embedder = Embedder()
+        # Share the same SentenceTransformer model with the retriever if already loaded
+        try:
+            retriever = get_retriever()
+            _embedder = Embedder(model=retriever.embedder)
+        except Exception:
+            # Retriever not available (no index), load embedder independently
+            _embedder = Embedder()
     return _embedder
 
 
 
 def _retrieve_product_context(
     feature_text: str,
-    top_k: int = None,
+    top_k: Optional[int] = None,
 ) -> str:
-    from core.config import config
-    if top_k is None:
-        top_k = config.quality.top_k
     """
     Retrieve relevant product knowledge and format it
     as context for the LLM prompt.
     """
+    from core.config import config
+    if top_k is None:
+        top_k = config.quality.top_k
     chunks = get_retriever().retrieve(
         query_text=feature_text,
         top_k=top_k,
@@ -147,16 +163,14 @@ def _clean_json_output(text: str) -> str:
     2. Removes markdown code blocks.
     3. extracts the main JSON array [ ... ].
     """
-    import re
-    
     # 1. Remove <think> blocks (just in case model slips into thinking mode)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = _THINK_PATTERN.sub('', text)
     
     # 2. Remove markdown code blocks
     text = text.strip()
     if "```" in text:
         # Regex to capture content inside ```json ... ``` or just ``` ... ```
-        match = re.search(r'```(?:json)?(.*?)```', text, re.DOTALL)
+        match = _CODE_BLOCK_PATTERN.search(text)
         if match:
             text = match.group(1).strip()
             
@@ -241,37 +255,75 @@ def _generate_single_suite(
     ) from last_error
 
 
+def _process_single_chunk(
+    index: int,
+    chunk: str,
+    model: str,
+    max_retries: int,
+    product_context: str,
+    app_type: str,
+) -> List[dict]:
+    """
+    Process a single chunk: condense, build prompt, generate test cases.
+    Designed to be called in parallel.
+    """
+    condensed = _condense_chunk(chunk, model)
+    chunk_prompt = _build_prompt(
+        feature_chunks=[condensed],
+        product_context=product_context,
+        app_type=app_type
+    )
+
+    try:
+        return _generate_single_suite(
+            prompt=chunk_prompt,
+            model=model,
+            max_retries=max_retries,
+        )
+    except GenerationError as exc:
+        raise GenerationError(
+            f"Failed to generate test cases for chunk {index}"
+        ) from exc
+
+
 def _generate_from_chunks(
     chunks: List[str],
     model: str,
     max_retries: int,
-    app_type: str = "web"
+    product_context: str = "",
+    app_type: str = "web",
+    max_workers: int = 4,
 ) -> List[dict]:
     """
-    Generate test cases independently for each chunk.
+    Generate test cases for each chunk in parallel using threads.
+    LLM calls are I/O-bound so threading provides near-linear speedup.
     """
     all_test_cases: List[dict] = []
 
-    for index, chunk in enumerate(chunks):
-        condensed = _condense_chunk(chunk, model)
-        chunk_prompt = _build_prompt(
-            feature_chunks=[condensed],
-            product_context="",
-            app_type=app_type
+    if len(chunks) == 1:
+        # No need for thread overhead with a single chunk
+        return _process_single_chunk(
+            0, chunks[0], model, max_retries, product_context, app_type
         )
 
+    # Use ThreadPoolExecutor for parallel I/O-bound LLM calls
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as executor:
+        future_to_index = {
+            executor.submit(
+                _process_single_chunk,
+                index, chunk, model, max_retries, product_context, app_type
+            ): index
+            for index, chunk in enumerate(chunks)
+        }
 
-        try:
-            test_cases = _generate_single_suite(
-                prompt=chunk_prompt,
-                model=model,
-                max_retries=max_retries,
-            )
-            all_test_cases.extend(test_cases)
-        except GenerationError as exc:
-            raise GenerationError(
-                f"Failed to generate test cases for chunk {index}"
-            ) from exc
+        # Collect results in original chunk order
+        results_by_index = {}
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            results_by_index[index] = future.result()  # Re-raises exceptions
+
+        for i in sorted(results_by_index.keys()):
+            all_test_cases.extend(results_by_index[i])
 
     return all_test_cases
 
@@ -356,8 +408,6 @@ def _deduplicate_test_cases(
     """
     Remove duplicate or near duplicate test cases across chunks.
     """
-    import re
-    
     def normalize_for_dedup(text: str) -> str:
         """Normalize text for deduplication: lowercase, strip punctuation, collapse whitespace."""
         if text is None:
@@ -399,64 +449,65 @@ def _deduplicate_test_cases(
 def _deduplicate_semantically(
     test_cases: list[dict],
     threshold: float = 0.85,
-) -> list[dict]:
+    _cached_embeddings: list = None,
+) -> tuple[list[dict], list]:
     """
     Remove semantically similar test cases using embeddings.
+    Returns (deduplicated_cases, embeddings) so embeddings can be reused.
+    Uses batched matrix multiplication for efficient similarity computation.
     """
     if not test_cases:
-        return []
+        return [], []
 
     # 1. Prepare texts for embedding
-    # We combine use_case + test_case + steps to form a signature
     texts = []
     for case in test_cases:
         content = f"{case.get('use_case', '')} {case.get('test_case', '')}"
         steps = " ".join(case.get('steps', []))
         texts.append(f"{content} {steps}")
 
-    # 2. Generate embeddings
-    try:
-        embeddings = get_embedder().embed_strings(texts)
-    except Exception:
-        # Fallback if embedding fails
-        return test_cases
+    # 2. Generate embeddings (reuse cached ones for existing cases, embed only new ones)
+    if _cached_embeddings and len(_cached_embeddings) <= len(texts):
+        # Embed only newly added cases
+        new_texts = texts[len(_cached_embeddings):]
+        try:
+            new_embeddings = get_embedder().embed_strings(new_texts) if new_texts else []
+        except Exception:
+            return test_cases, _cached_embeddings or []
+        embeddings = _cached_embeddings + new_embeddings
+    else:
+        try:
+            embeddings = get_embedder().embed_strings(texts)
+        except Exception:
+            return test_cases, []
 
     if not embeddings:
-        return test_cases
+        return test_cases, []
 
-    # 3. Compute similarity and filter
-    # Simple O(N^2) comparison is fine for typically small number of test cases (< 50)
-    
+    # 3. Batched cosine similarity using matrix multiplication
+    emb_matrix = np.array(embeddings, dtype=np.float32)
+    similarity_matrix = emb_matrix @ emb_matrix.T
+
     indices_to_remove = set()
     n = len(embeddings)
-    
-    # Pre-normalize for cosine similarity if not already done by embedder, 
-    # but Embedder.embed_strings does normalize=True.
-    
-    # We can use simple dot product since they are normalized
+
     for i in range(n):
         if i in indices_to_remove:
             continue
-            
-        vec_i = embeddings[i]
-        
         for j in range(i + 1, n):
             if j in indices_to_remove:
                 continue
-                
-            vec_j = embeddings[j]
-            
-            # Cosine similarity
-            similarity = np.dot(vec_i, vec_j)
-            
-            if similarity > threshold:
-                # Mark j for removal (keep i as the "canonical" one)
+            if similarity_matrix[i, j] > threshold:
                 indices_to_remove.add(j)
 
-    return [
-        case for idx, case in enumerate(test_cases)
-        if idx not in indices_to_remove
-    ]
+    kept_cases = []
+    kept_embeddings = []
+    for idx, case in enumerate(test_cases):
+        if idx not in indices_to_remove:
+            kept_cases.append(case)
+            kept_embeddings.append(embeddings[idx])
+
+    return kept_cases, kept_embeddings
 
 
 def _prioritize_test_cases(test_cases: List[dict]) -> List[dict]:
@@ -528,22 +579,59 @@ def _clean_test_case_titles(test_cases: List[dict]) -> List[dict]:
     """
     Remove prefixes like 'TC-001: ', 'Case 1 - ', etc. from titles.
     """
-    import re
     cleaned = []
-    # Regex to match common prefixes:
-    # ^(TC|Case|Test|Scenario)\s*[-_:]?\s*\d+[:\s-]*
-    # e.g. "TC-001: Login" -> "Login"
-    prefix_pattern = re.compile(r'^(TC|Case|Test|Scenario|ID)\s*[-_#]?\s*\d+\s*[:\.-]?\s*', re.IGNORECASE)
     
     for case in test_cases:
         title = case.get("test_case", "")
         if title:
-            new_title = prefix_pattern.sub("", title).strip()
+            new_title = _TITLE_PREFIX_PATTERN.sub("", title).strip()
             case["test_case"] = new_title
         cleaned.append(case)
     return cleaned
 
 
+
+def _load_mobile_capabilities(file_path: str):
+    """
+    Load the mobile capabilities Excel file and return it as a DataFrame.
+    """
+    import pandas as pd
+    try:
+        return pd.read_excel(file_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load mobile capabilities file: {e}")
+        raise
+
+def _filter_capabilities_by_app_type(df, app_type: str):
+    """
+    Filter the capabilities DataFrame based on the app type (Android/iOS).
+    """
+    if app_type == "android":
+        return df[["Capabilities", "Android", "Supported Attributes - Android", "Yet to Support - Android", "Remarks"]]
+    elif app_type == "ios":
+        return df[["Capabilities", "iOS", "Supported Attributes - iOS", "Yet to Support - iOS", "Remarks"]]
+    else:
+        raise ValueError(f"Unsupported app type: {app_type}")
+
+def _apply_mobile_capabilities(feature_text: str, app_type: str, file_path: str) -> str:
+    """
+    Cross-reference the feature text with mobile capabilities and return filtered context.
+    """
+    import pandas as pd
+    df = _load_mobile_capabilities(file_path)
+    filtered_df = _filter_capabilities_by_app_type(df, app_type)
+
+    # Generate a summary of supported and unsupported attributes
+    summary = []
+    for _, row in filtered_df.iterrows():
+        capability = row["Capabilities"]
+        supported = row[f"Supported Attributes - {app_type.capitalize()}"]
+        yet_to_support = row[f"Yet to Support - {app_type.capitalize()}"]
+        remarks = row["Remarks"]
+
+        summary.append(f"Capability: {capability}\nSupported: {supported}\nYet to Support: {yet_to_support}\nRemarks: {remarks}\n")
+
+    return "\n".join(summary)
 
 def generate_test_suite(
     file_path: str,
@@ -562,7 +650,11 @@ def generate_test_suite(
     # Use configured model if not explicitly provided
     if model is None:
         model = config.general.model
-    chunks = parse_document(file_path)
+    chunks = parse_document(
+        file_path,
+        chunk_size=config.generation.chunk_size,
+        overlap=config.generation.chunk_overlap,
+    )
 
     feature_text = "\n\n".join(chunks)
     product_context = _retrieve_product_context(feature_text)
@@ -570,11 +662,12 @@ def generate_test_suite(
     # Determine final parameters (Arg > Config)
     final_app_type = app_type if app_type else config.generation.app_type
 
-    # Generate test cases from chunks
+    # Generate test cases from chunks (parallel, with RAG context)
     raw_test_cases = _generate_from_chunks(
         chunks=chunks,
         model=model,
         max_retries=max_retries,
+        product_context=product_context,
         app_type=final_app_type
     )
 
@@ -596,8 +689,9 @@ def generate_test_suite(
         merged_suite["test_cases"]
     )
     
+    _cached_emb = None
     if dedup_semantic:
-        merged_suite["test_cases"] = _deduplicate_semantically(
+        merged_suite["test_cases"], _cached_emb = _deduplicate_semantically(
             merged_suite["test_cases"],
             threshold=0.90  # Stricter threshold
         )
@@ -629,8 +723,14 @@ def generate_test_suite(
                 missing_cases = _clean_test_case_titles(missing_cases)
                 merged_suite["test_cases"].extend(missing_cases)
                 
-                # Re-deduplicate just in case
+                # Re-deduplicate (exact + semantic with cached embeddings)
                 merged_suite["test_cases"] = _deduplicate_test_cases(merged_suite["test_cases"])
+                if dedup_semantic:
+                    merged_suite["test_cases"], _cached_emb = _deduplicate_semantically(
+                        merged_suite["test_cases"],
+                        threshold=0.90,
+                        _cached_embeddings=_cached_emb,
+                    )
             else:
                 print("[INFO] Cross-reference complete. No missing test cases identified.")
         except Exception as e:

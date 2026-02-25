@@ -1,4 +1,5 @@
 import json
+import re
 from typing import List, Optional
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from core.knowledge.models import KnowledgeChunk
+
+# Precompiled tokenizer for BM25 (strips punctuation, lowercases)
+_BM25_TOKEN_PATTERN = re.compile(r'\w+')
 
 
 class RetrievalError(Exception):
@@ -83,11 +87,15 @@ class KnowledgeRetriever:
             dtype=np.float32,
         )
         
-        # 4. Prepare Sparse Index (BM25)
+        # Free embedding data from the in-memory index to halve memory usage
+        for item in self.index:
+            del item["embedding"]
+        
+        # 4. Prepare Sparse Index (BM25) with proper tokenization
         self.bm25 = None
         try:
             from rank_bm25 import BM25Okapi
-            tokenized_corpus = [item["text"].split() for item in self.index]
+            tokenized_corpus = [_BM25_TOKEN_PATTERN.findall(item["text"].lower()) for item in self.index]
             self.bm25 = BM25Okapi(tokenized_corpus)
             if self.debug:
                 print(f"DEBUG: BM25 index built with {len(tokenized_corpus)} documents")
@@ -103,8 +111,11 @@ class KnowledgeRetriever:
         if not query_text.strip():
             return []
 
+        # top_k == -1 means retrieve ALL chunks
+        retrieve_all = top_k == -1
+
         if self.debug:
-            print(f"DEBUG: Retrieving for query: '{query_text[:50]}...'")
+            print(f"DEBUG: Retrieving for query: '{query_text[:50]}...' (top_k={'ALL' if retrieve_all else top_k})")
 
         # --- Step 1: Hybrid Retrieval (Dense + Sparse) ---
         
@@ -114,7 +125,7 @@ class KnowledgeRetriever:
         
         # B. Sparse Search (BM25)
         if self.bm25:
-            tokenized_query = query_text.split()
+            tokenized_query = _BM25_TOKEN_PATTERN.findall(query_text.lower())
             sparse_scores = self.bm25.get_scores(tokenized_query)
             # Normalize sparse scores (simple min-max)
             if sparse_scores.max() > 0:
@@ -128,8 +139,11 @@ class KnowledgeRetriever:
         if self.debug:
             print(f"DEBUG: Score range: [{hybrid_scores.min():.3f}, {hybrid_scores.max():.3f}]")
         
-        # Determine initial retrieval set (larger than top_k for re-ranking)
-        initial_k = top_k * 3 if self.use_reranker else top_k
+        # Determine initial retrieval set (larger than top_k for re-ranking, or all)
+        if retrieve_all:
+            initial_k = len(self.index)
+        else:
+            initial_k = top_k * 3 if self.use_reranker else top_k
         ranked_indices = np.argsort(hybrid_scores)[::-1][:initial_k]
         
         candidates = []
@@ -169,11 +183,17 @@ class KnowledgeRetriever:
             scored_candidates = list(zip(items_only, rerank_scores))
             scored_candidates.sort(key=lambda x: x[1], reverse=True)
             
-            # Take top_k
-            final_selection = [item for item, _ in scored_candidates[:top_k]]
+            # Take top_k (or all if retrieve_all)
+            if retrieve_all:
+                final_selection = [item for item, _ in scored_candidates]
+            else:
+                final_selection = [item for item, _ in scored_candidates[:top_k]]
         else:
             # No re-ranking, just extract items from tuples
-            final_selection = [item for item, _ in candidates[:top_k]]
+            if retrieve_all:
+                final_selection = [item for item, _ in candidates]
+            else:
+                final_selection = [item for item, _ in candidates[:top_k]]
 
         if self.debug:
             print(f"DEBUG: Returning {len(final_selection)} results")

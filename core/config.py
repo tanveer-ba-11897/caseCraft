@@ -31,17 +31,22 @@ class OutputSettings(BaseModel):
     default_format: str = Field("excel", description="Default output format (excel/json)")
     output_dir: str = Field("outputs", description="Default output directory")
 
+class KnowledgeSettings(BaseModel):
+    kb_chunk_size: int = Field(1500, description="Max characters per knowledge base chunk during ingestion")
+    min_score_threshold: float = Field(0.1, description="Minimum hybrid score to include a retrieval result (0.0 - 1.0). Lower = more results.")
+
 class QualitySettings(BaseModel):
     semantic_deduplication: bool = Field(True, description="Enable semantic deduplication")
     similarity_threshold: float = Field(0.85, description="Similarity threshold for deduplication")
     reviewer_pass: bool = Field(False, description="Enable AI reviewer pass")
-    top_k: int = Field(5, description="Number of context chunks to retrieve")
+    top_k: int = Field(5, description="Number of context chunks to retrieve. Set to -1 to retrieve ALL chunks.")
 
 class CaseCraftConfig(BaseModel):
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     generation: GenerationSettings = Field(default_factory=GenerationSettings)
     output: OutputSettings = Field(default_factory=OutputSettings)
     quality: QualitySettings = Field(default_factory=QualitySettings)
+    knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
 
 def load_config(config_path: Optional[str] = None) -> CaseCraftConfig:
     """
@@ -78,7 +83,8 @@ def load_config(config_path: Optional[str] = None) -> CaseCraftConfig:
         "general": GeneralSettings,
         "generation": GenerationSettings,
         "output": OutputSettings,
-        "quality": QualitySettings
+        "quality": QualitySettings,
+        "knowledge": KnowledgeSettings,
     }
 
     for section_name, section_model in sections.items():

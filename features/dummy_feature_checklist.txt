@@ -1,2 +1,0 @@
-- Make sure to test SQL injection in the email field.
-- Make sure to test logging in with a very long password (>256 chars).

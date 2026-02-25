@@ -162,8 +162,9 @@ def query_knowledge(query: str, top_k: int = 3) -> str:
     Search the CaseCraft knowledge base for relevant snippets.
     Useful for answering questions about product requirements.
     """
-    # Clamp top_k to prevent resource exhaustion
-    top_k = max(1, min(top_k, 20))
+    # Clamp top_k to prevent resource exhaustion (-1 means retrieve all)
+    if top_k != -1:
+        top_k = max(1, min(top_k, 20))
     # Truncate query to prevent excessive memory usage
     query = query[:10000]
 
