@@ -40,6 +40,7 @@ class OutputSettings(BaseModel):
     output_dir: str = Field("outputs", description="Default output directory")
 
 class KnowledgeSettings(BaseModel):
+    vector_db_path: str = Field("knowledge_base/chroma_db", description="ChromaDB persistence directory for the vector store")
     kb_chunk_size: int = Field(1500, description="Max characters per knowledge base chunk during ingestion")
     min_score_threshold: float = Field(0.1, description="Minimum hybrid score to include a retrieval result (0.0 - 1.0). Lower = more results.")
     query_decomposition: bool = Field(True, description="Decompose long queries into focused sub-queries for better retrieval")

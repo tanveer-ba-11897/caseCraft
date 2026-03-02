@@ -413,11 +413,8 @@ def _handle_ingest(request_id: str, params: dict) -> None:
 
         from core.knowledge.ingest import ingest_documents
 
-        index_path = PROJECT_ROOT / "knowledge_base" / "index.json"
-
         result = ingest_documents(
             docs,
-            index_path,
             progress=lambda stage, msg: _send_progress(request_id, stage, msg),
         )
 

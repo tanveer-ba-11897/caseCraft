@@ -222,6 +222,9 @@ knowledge_base/index.json.sha256
 outputs/
 *.xlsx
 
+# ChromaDB persistent vector store
+knowledge_base/chroma_db/
+
 # CaseCraft Configuration & Secrets
 casecraft.yaml
 casecraft_config.json

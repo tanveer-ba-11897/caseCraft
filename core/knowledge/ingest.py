@@ -1,23 +1,27 @@
 """
 Shared knowledge-base ingestion pipeline.
 
-This module extracts the common chunk → embed → merge → write → hash
-pipeline used by both ``cli/ingest.py`` and ``bridge_server.py`` so the
-logic lives in exactly one place.
+This module extracts the common chunk → embed → store pipeline used by
+both ``cli/ingest.py`` and ``bridge_server.py`` so the logic lives in
+exactly one place.
+
+Storage backend: ChromaDB persistent vector store.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import platform
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from core.knowledge.chunker import chunk_document
 from core.knowledge.embedder import Embedder
 from core.knowledge.models import KnowledgeChunk, RawDocument
+from core.knowledge.vector_store import (
+    VectorStore,
+    DEFAULT_PERSIST_DIR,
+    DEFAULT_COLLECTION,
+)
 
 logger = logging.getLogger("casecraft.ingest")
 
@@ -39,8 +43,9 @@ class IngestResult:
 
 def ingest_documents(
     docs: List[RawDocument],
-    index_path: str | Path,
+    persist_dir: str | Path = DEFAULT_PERSIST_DIR,
     *,
+    collection_name: str = DEFAULT_COLLECTION,
     kb_chunk_size: int = 1500,
     progress: ProgressCallback = None,
 ) -> IngestResult:
@@ -50,8 +55,10 @@ def ingest_documents(
     ----------
     docs:
         Parsed raw documents to ingest.
-    index_path:
-        Path to the knowledge index JSON file.
+    persist_dir:
+        ChromaDB persistence directory.
+    collection_name:
+        ChromaDB collection name.
     kb_chunk_size:
         Maximum characters per knowledge-base chunk (passed to the chunker).
     progress:
@@ -69,8 +76,6 @@ def ingest_documents(
     """
     if not docs:
         raise ValueError("No documents to ingest")
-
-    index_path = Path(index_path)
 
     def _progress(stage: str, msg: str) -> None:
         if progress:
@@ -90,63 +95,19 @@ def ingest_documents(
     embedder = Embedder()
     embedder.embed_chunks(all_chunks)
 
-    # ── 3. Merge with existing index ──────────────────────────────────────
-    _progress("saving", "Updating knowledge index…")
-    index_path.parent.mkdir(parents=True, exist_ok=True)
+    # ── 3. Store in ChromaDB ──────────────────────────────────────────────
+    _progress("saving", "Storing chunks in vector database…")
+    store = VectorStore(
+        persist_dir=str(persist_dir),
+        collection_name=collection_name,
+    )
+    added = store.add_chunks(all_chunks)
+    total = store.count()
 
-    existing: list = []
-    if index_path.exists():
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-            if isinstance(raw_data, list):
-                # Accept entries that have at least 'text' and 'metadata'
-                existing = [
-                    entry for entry in raw_data
-                    if isinstance(entry, dict)
-                    and "text" in entry
-                    and "metadata" in entry
-                ]
-                skipped = len(raw_data) - len(existing)
-                if skipped:
-                    logger.warning("Skipped %d invalid entries in existing index", skipped)
-            else:
-                logger.warning("Invalid index format — starting fresh")
-                existing = []
-        except (json.JSONDecodeError, OSError) as read_err:
-            logger.warning("Could not read existing index, starting fresh: %s", read_err)
-            existing = []
-
-    for chunk in all_chunks:
-        entry: dict = {
-            "text": chunk.text,
-            "metadata": chunk.metadata,
-            "embedding": chunk.embedding if chunk.embedding is not None else [],
-        }
-        if chunk.id:
-            entry["id"] = chunk.id
-        existing.append(entry)
-
-    # ── 4. Write index ────────────────────────────────────────────────────
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, ensure_ascii=False)
-
-    # ── 5. Integrity hash (R3) ────────────────────────────────────────────
-    try:
-        from core.knowledge.integrity import write_hash
-        write_hash(index_path)
-    except Exception as hash_err:
-        logger.warning("Could not write index integrity hash: %s", hash_err)
-
-    # ── 6. Restrict file permissions (best-effort) ────────────────────────
-    try:
-        os.chmod(index_path, 0o600)
-    except OSError:
-        if platform.system() != "Windows":
-            logger.warning("Could not restrict index file permissions")
+    logger.info("Stored %d new chunks (%d total in collection)", added, total)
 
     return IngestResult(
         documents=len(docs),
         chunks=len(all_chunks),
-        total_index_size=len(existing),
+        total_index_size=total,
     )

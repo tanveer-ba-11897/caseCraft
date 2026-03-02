@@ -42,6 +42,7 @@ def get_retriever():
         if _retriever is None:
             from core.config import config
             _retriever = KnowledgeRetriever(
+                persist_dir=config.knowledge.vector_db_path,
                 min_score_threshold=config.knowledge.min_score_threshold,
             )
     return _retriever

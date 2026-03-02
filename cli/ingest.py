@@ -28,44 +28,43 @@ from core.knowledge.ingest import ingest_documents
 from core.config import load_config
 
 
-def _validate_index_path(index_path: str) -> str:
-    """Validate that the index path is within the project directory."""
+def _validate_db_path(db_path: str) -> str:
+    """Validate that the DB path is within the project directory."""
     project_root = Path(__file__).parent.parent.resolve()
-    resolved = Path(index_path).resolve()
+    resolved = Path(db_path).resolve()
     try:
         resolved.relative_to(project_root)
     except ValueError:
-        raise ValueError(f"Index path must be within the project directory. Got: {index_path}")
+        raise ValueError(f"DB path must be within the project directory. Got: {db_path}")
     return str(resolved)
 
 
-def ingest_to_index(documents, index_path: str = "knowledge_base/index.json"):
+def ingest_to_index(documents, db_path: str = "knowledge_base/chroma_db"):
     """
-    Chunk, embed, and save documents to the knowledge index.
+    Chunk, embed, and save documents to the ChromaDB vector store.
     """
-    # Validate index path to prevent arbitrary file writes
-    _validate_index_path(index_path)
+    _validate_db_path(db_path)
 
     if not documents:
         print("[WARN] No documents to ingest")
         return
 
-    # Load config for knowledge base chunk size
     cfg = load_config()
     kb_chunk_size = cfg.knowledge.kb_chunk_size
     print(f"[INFO] Using knowledge base chunk size: {kb_chunk_size} chars")
+    print(f"[INFO] Vector store: {db_path}")
 
     def _print_progress(stage: str, msg: str) -> None:
         print(f"[INFO] {msg}")
 
     result = ingest_documents(
         documents,
-        index_path,
+        persist_dir=db_path,
         kb_chunk_size=kb_chunk_size,
         progress=_print_progress,
     )
 
-    print(f"[SUCCESS] Saved {result.total_index_size} total entries to {index_path}")
+    print(f"[SUCCESS] Stored {result.total_index_size} total chunks in {db_path}")
 
 
 def cmd_ingest_sitemap(args):
@@ -89,7 +88,7 @@ def cmd_ingest_sitemap(args):
     print(f"[INFO] Config: delay={config.delay_between_requests}s, max_pages={config.max_pages}")
     
     documents = load_from_sitemap(args.sitemap_url, config)
-    ingest_to_index(documents, args.index)
+    ingest_to_index(documents, args.db_path)
 
 
 def cmd_ingest_url(args):
@@ -104,14 +103,14 @@ def cmd_ingest_url(args):
     
     print(f"[INFO] Loading URL: {args.url}")
     doc = load_from_url(args.url, config)
-    ingest_to_index([doc], args.index)
+    ingest_to_index([doc], args.db_path)
 
 
 def cmd_ingest_docs(args):
     """Handle ingest-docs command."""
     print(f"[INFO] Loading documents from: {args.directory}")
     documents = load_documents(args.directory)
-    ingest_to_index(documents, args.index)
+    ingest_to_index(documents, args.db_path)
 
 
 def cmd_ingest_urls(args):
@@ -146,7 +145,7 @@ def cmd_ingest_urls(args):
     )
     
     documents = load_from_url_list(urls, config)
-    ingest_to_index(documents, args.index)
+    ingest_to_index(documents, args.db_path)
 
 
 def main():
@@ -190,9 +189,9 @@ def main():
         help="URL patterns to exclude (e.g., /api/ /blog/)"
     )
     sitemap_parser.add_argument(
-        "--index", "-i",
-        default="knowledge_base/index.json",
-        help="Path to knowledge index file"
+        "--db-path",
+        default="knowledge_base/chroma_db",
+        help="ChromaDB persistence directory (default: knowledge_base/chroma_db)"
     )
     
     # Single URL command
@@ -211,9 +210,9 @@ def main():
         help="Request timeout in seconds (default: 30)"
     )
     url_parser.add_argument(
-        "--index", "-i",
-        default="knowledge_base/index.json",
-        help="Path to knowledge index file"
+        "--db-path",
+        default="knowledge_base/chroma_db",
+        help="ChromaDB persistence directory (default: knowledge_base/chroma_db)"
     )
     
     # Local docs command
@@ -226,9 +225,9 @@ def main():
         help="Directory containing documents (PDF, MD, TXT)"
     )
     docs_parser.add_argument(
-        "--index", "-i",
-        default="knowledge_base/index.json",
-        help="Path to knowledge index file"
+        "--db-path",
+        default="knowledge_base/chroma_db",
+        help="ChromaDB persistence directory (default: knowledge_base/chroma_db)"
     )
     
     # URL list file command
@@ -253,9 +252,9 @@ def main():
         help="Request timeout in seconds (default: 30)"
     )
     urls_parser.add_argument(
-        "--index", "-i",
-        default="knowledge_base/index.json",
-        help="Path to knowledge index file"
+        "--db-path",
+        default="knowledge_base/chroma_db",
+        help="ChromaDB persistence directory (default: knowledge_base/chroma_db)"
     )
     
     args = parser.parse_args()

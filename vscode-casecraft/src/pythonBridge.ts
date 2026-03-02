@@ -32,12 +32,16 @@ interface PendingRequest {
     resolve: (data: Record<string, unknown>) => void;
     reject: (error: Error) => void;
     onProgress?: (step: string, detail: string) => void;
+    lastActivity: number; // timestamp of last progress/llm event
 }
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
-const REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50 MB safety limit
+const REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes max total
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000;    // 10 minutes without any activity
+const IDLE_CHECK_INTERVAL_MS = 30 * 1000;  // check every 30 seconds
+const READY_TIMEOUT_MS = 60 * 1000;        // 60 seconds for Python bridge startup
+const MAX_BUFFER_SIZE = 50 * 1024 * 1024;  // 50 MB safety limit
 const SPAWN_RETRY_DELAY_MS = 2000;
 const MAX_SPAWN_RETRIES = 3;
 
@@ -50,6 +54,8 @@ export class PythonBridge implements vscode.Disposable {
     private ready = false;
     private readyPromise: Promise<void>;
     private readyResolve!: () => void;
+    private readyReject!: (err: Error) => void;
+    private readyTimeoutId: ReturnType<typeof setTimeout> | undefined;
     private lmBridge: LmBridge;
     private config: CaseCraftConfig;
     private disposed = false;
@@ -63,10 +69,35 @@ export class PythonBridge implements vscode.Disposable {
         this.config = config;
         this.lmBridge = new LmBridge();
         this.outputChannel = vscode.window.createOutputChannel('CaseCraft');
-        this.readyPromise = new Promise((resolve) => {
-            this.readyResolve = resolve;
-        });
+        this.readyPromise = new Promise(() => {}); // replaced by resetReadyPromise()
+        this.resetReadyPromise();
         this.spawn();
+    }
+
+    /**
+     * Create a fresh ready-promise with an auto-reject timeout.
+     * Safely rejects any previously outstanding promise first.
+     */
+    private resetReadyPromise(): void {
+        // Reject the old promise so any awaiter unblocks with an error
+        this.readyReject?.(new Error('Python bridge restarting'));
+
+        clearTimeout(this.readyTimeoutId);
+
+        this.readyPromise = new Promise<void>((resolve, reject) => {
+            this.readyResolve = resolve;
+            this.readyReject = reject;
+        });
+
+        // Auto-reject if Python never sends the "ready" handshake
+        this.readyTimeoutId = setTimeout(() => {
+            if (!this.ready) {
+                this.readyReject(new Error(
+                    'Python bridge failed to start within 60 seconds. ' +
+                    'Check the "CaseCraft" output channel for details.'
+                ));
+            }
+        }, READY_TIMEOUT_MS);
     }
 
     /* ── Process lifecycle ──────────────────────────────────────────────── */
@@ -161,6 +192,11 @@ export class PythonBridge implements vscode.Disposable {
                     this.outputChannel.appendLine(
                         `[CaseCraft] Max retries (${MAX_SPAWN_RETRIES}) exceeded.`
                     );
+                    // Reject the ready promise so any awaiting sendRequest unblocks
+                    this.readyReject?.(new Error(
+                        'Python bridge failed after multiple attempts. ' +
+                        'Check the "CaseCraft" output channel.'
+                    ));
                     vscode.window.showErrorMessage(
                         'CaseCraft: Python bridge failed after multiple attempts. ' +
                         'Check the "CaseCraft" output channel.',
@@ -173,10 +209,11 @@ export class PythonBridge implements vscode.Disposable {
                     return;
                 }
 
-                this.readyPromise = new Promise((resolve) => {
-                    this.readyResolve = resolve;
-                });
+                this.resetReadyPromise();
                 setTimeout(() => this.spawn(), SPAWN_RETRY_DELAY_MS);
+            } else {
+                // Extension disposed — reject so nothing hangs
+                this.readyReject?.(new Error('CaseCraft extension disposed'));
             }
         });
     }
@@ -198,6 +235,7 @@ export class PythonBridge implements vscode.Disposable {
         if (msg.type === 'ready') {
             this.ready = true;
             this.spawnRetries = 0; // Reset on successful start
+            clearTimeout(this.readyTimeoutId);
             this.readyResolve();
             this.outputChannel.appendLine('[CaseCraft] Python bridge is ready');
             return;
@@ -222,6 +260,7 @@ export class PythonBridge implements vscode.Disposable {
 
         switch (msg.type) {
             case 'progress':
+                pending.lastActivity = Date.now();
                 pending.onProgress?.(
                     (msg.data?.step as string) ?? '',
                     (msg.data?.detail as string) ?? ''
@@ -247,6 +286,11 @@ export class PythonBridge implements vscode.Disposable {
     /* ── LLM proxy ──────────────────────────────────────────────────────── */
 
     private async handleLlmRequest(msg: BridgeMessage): Promise<void> {
+        // Any LLM request proves the Python bridge is alive — reset idle timers
+        for (const [, req] of this.pendingRequests) {
+            req.lastActivity = Date.now();
+        }
+
         const reqId = msg.id;
         const prompt = (msg.data?.prompt as string) ?? '';
         const model = (msg.data?.model as string) ?? '';
@@ -315,9 +359,27 @@ export class PythonBridge implements vscode.Disposable {
         onProgress?: (step: string, detail: string) => void,
         token?: vscode.CancellationToken
     ): Promise<Record<string, unknown>> {
-        await this.readyPromise;
+        // Wait for the Python bridge to be ready (may reject on timeout/failure)
+        try {
+            await this.readyPromise;
+        } catch {
+            // Previous ready failed; if we still have retries, reset and try again
+            if (!this.disposed && this.spawnRetries <= MAX_SPAWN_RETRIES) {
+                this.ready = false;
+                this.resetReadyPromise();
+                this.spawn();
+                await this.readyPromise;
+            } else {
+                throw new Error(
+                    'Python bridge is not available. ' +
+                    'Check the "CaseCraft" output channel for details.'
+                );
+            }
+        }
 
         if (!this.process) {
+            this.ready = false;
+            this.resetReadyPromise();
             this.spawn();
             await this.readyPromise;
         }
@@ -325,9 +387,17 @@ export class PythonBridge implements vscode.Disposable {
         const id = crypto.randomUUID();
 
         return new Promise<Record<string, unknown>>((resolve, reject) => {
-            this.pendingRequests.set(id, { resolve, reject, onProgress });
+            this.pendingRequests.set(id, { resolve, reject, onProgress, lastActivity: Date.now() });
 
-            this.writeMessage({ id, method, params });
+            try {
+                this.writeMessage({ id, method, params });
+            } catch (err: unknown) {
+                // writeMessage failed (stdin not writable) — clean up immediately
+                this.pendingRequests.delete(id);
+                const msg = err instanceof Error ? err.message : String(err);
+                reject(new Error(`Failed to send request to Python bridge: ${msg}`));
+                return;
+            }
 
             // Cancellation token support
             let disposable: vscode.Disposable | undefined;
@@ -348,15 +418,43 @@ export class PythonBridge implements vscode.Disposable {
                         reject(new Error('Request was cancelled'));
                     }
                     disposable?.dispose();
+                    clearInterval(idleTimer);
+                    clearTimeout(maxTimer);
                 });
             }
 
-            // Safety timeout
-            setTimeout(() => {
+            // Rolling idle timeout: resets whenever the Python side sends
+            // a progress event or LLM request for this request id.
+            const idleTimer = setInterval(() => {
+                const req = this.pendingRequests.get(id);
+                if (!req) {
+                    clearInterval(idleTimer);
+                    return;
+                }
+                const idleMs = Date.now() - req.lastActivity;
+                if (idleMs > IDLE_TIMEOUT_MS) {
+                    this.pendingRequests.delete(id);
+                    clearInterval(idleTimer);
+                    clearTimeout(maxTimer);
+                    disposable?.dispose();
+                    const idleMin = Math.round(IDLE_TIMEOUT_MS / 60000);
+                    reject(new Error(
+                        `Request timed out — no activity from the Python backend for ${idleMin} minutes. ` +
+                        'The generation may have stalled. Check the "CaseCraft" output channel for details.'
+                    ));
+                }
+            }, IDLE_CHECK_INTERVAL_MS);
+
+            // Hard max timeout (safety net)
+            const maxTimer = setTimeout(() => {
                 if (this.pendingRequests.has(id)) {
                     this.pendingRequests.delete(id);
+                    clearInterval(idleTimer);
                     disposable?.dispose();
-                    reject(new Error('Request timed out after 30 minutes'));
+                    reject(new Error(
+                        'Request timed out after 30 minutes. ' +
+                        'Check the "CaseCraft" output channel for details.'
+                    ));
                 }
             }, REQUEST_TIMEOUT_MS);
         });
@@ -374,6 +472,8 @@ export class PythonBridge implements vscode.Disposable {
 
     dispose(): void {
         this.disposed = true;
+        clearTimeout(this.readyTimeoutId);
+        this.readyReject?.(new Error('CaseCraft extension disposed'));
         this.process?.kill();
         this.process = null;
         this.outputChannel.dispose();

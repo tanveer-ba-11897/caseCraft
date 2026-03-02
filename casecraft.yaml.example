@@ -108,6 +108,10 @@ quality:
 # Knowledge Base Settings
 # --------------------------
 knowledge:
+  # ChromaDB persistence directory for the vector store.
+  # Data is stored on disk — no reload on restart.
+  vector_db_path: "knowledge_base/chroma_db"
+
   kb_chunk_size: 1500
   min_score_threshold: 0.1
 
