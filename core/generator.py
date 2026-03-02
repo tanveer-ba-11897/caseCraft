@@ -1,9 +1,12 @@
 import json
+import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
+from tqdm import tqdm
 
 from core.schema import TestSuite
 from core.parser import parse_document
@@ -11,6 +14,8 @@ from core.knowledge.retriever import KnowledgeRetriever
 from core.knowledge.embedder import Embedder
 from core.prompts import build_generation_prompt, build_condensation_prompt, build_reviewer_prompt
 from core.llm_client import llm_client
+
+logger = logging.getLogger("casecraft.generator")
 
 # Precompiled regex patterns for _clean_json_output
 _THINK_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
@@ -23,60 +28,189 @@ class GenerationError(Exception):
     """Raised when test case generation fails."""
     pass
 
-# Lazy loaded singletons
+# Thread-safe lazy loaded singletons
 _retriever = None
 _embedder = None
+_singleton_lock = threading.Lock()
 
 def get_retriever():
     global _retriever
-    if _retriever is None:
-        from core.config import config
-        _retriever = KnowledgeRetriever(
-            min_score_threshold=config.knowledge.min_score_threshold,
-        )
+    if _retriever is not None:
+        return _retriever
+    with _singleton_lock:
+        # Double-check inside lock
+        if _retriever is None:
+            from core.config import config
+            _retriever = KnowledgeRetriever(
+                min_score_threshold=config.knowledge.min_score_threshold,
+            )
     return _retriever
 
 def get_embedder():
     global _embedder
-    if _embedder is None:
-        # Share the same SentenceTransformer model with the retriever if already loaded
-        try:
-            retriever = get_retriever()
-            _embedder = Embedder(model=retriever.embedder)
-        except Exception:
-            # Retriever not available (no index), load embedder independently
-            _embedder = Embedder()
+    if _embedder is not None:
+        return _embedder
+    with _singleton_lock:
+        # Double-check inside lock
+        if _embedder is None:
+            # Share the same SentenceTransformer model with the retriever if already loaded
+            try:
+                retriever = get_retriever()
+                _embedder = Embedder(model=retriever.embedder)
+            except Exception:
+                # Retriever not available (no index), load embedder independently
+                _embedder = Embedder()
     return _embedder
 
+
+
+def _compute_kb_budget() -> int:
+    """
+    Compute the character budget available for knowledge base context
+    in a single LLM prompt, based on context window and output token settings.
+
+    Uses the dynamically resolved context window (auto-detected from model
+    and capped at max_context_window from YAML).
+
+    Rough formula:
+        available_input_tokens = context_window_size - max_output_tokens
+        available_input_chars  = available_input_tokens * 4  (approx 4 chars/token)
+        kb_budget              = available_input_chars - PROMPT_OVERHEAD
+
+    PROMPT_OVERHEAD accounts for the generation template (~5K chars),
+    the condensed feature chunk (~3K chars), and a safety margin.
+    """
+    from core.config import config
+    from core.llm_client import llm_client
+
+    # Use dynamic context window resolution
+    ctx = llm_client.get_effective_context_window(config.general.model)
+
+    # Use dynamic output token resolution
+    max_out = llm_client.get_effective_max_output_tokens(config.general.model)
+    available_tokens = max(ctx - max_out, 1024)  # floor at 1024
+    available_chars = available_tokens * 4
+
+    PROMPT_OVERHEAD = 10_000  # template + condensed feature + safety margin
+    budget = max(available_chars - PROMPT_OVERHEAD, 5_000)
+    return budget
+
+
+def _batch_context_strings(context_blocks: List[str], budget: int) -> List[str]:
+    """
+    Split a list of context block strings into batches where each batch's
+    combined length stays within *budget* characters.
+
+    Every block appears in exactly one batch — no knowledge is lost.
+    If a single block exceeds the budget it gets its own batch.
+    """
+    if not context_blocks:
+        return [""]
+
+    batches: List[str] = []
+    current_batch: List[str] = []
+    current_len = 0
+    SEPARATOR_LEN = 2  # "\n\n" between blocks
+
+    for block in context_blocks:
+        block_len = len(block) + (SEPARATOR_LEN if current_batch else 0)
+
+        if current_batch and current_len + block_len > budget:
+            # Flush current batch
+            batches.append("\n\n".join(current_batch))
+            current_batch = [block]
+            current_len = len(block)
+        else:
+            current_batch.append(block)
+            current_len += block_len
+
+    if current_batch:
+        batches.append("\n\n".join(current_batch))
+
+    return batches
 
 
 def _retrieve_product_context(
     feature_text: str,
     top_k: Optional[int] = None,
-) -> str:
+) -> List[str]:
     """
-    Retrieve relevant product knowledge and format it
-    as context for the LLM prompt.
+    Retrieve relevant product knowledge using query transforms, format it,
+    and split into batches that fit within the model's context window budget.
+
+    Query Transform Pipeline:
+    1. Decomposition — splits feature text into focused sub-queries
+    2. Expansion — enriches queries with domain synonyms
+    3. Multi-query retrieval — merges results from all transformed queries
+
+    Returns a list of context-batch strings. If the total context is small
+    enough, the list will contain a single element.
     """
     from core.config import config
     if top_k is None:
         top_k = config.quality.top_k
-    chunks = get_retriever().retrieve(
-        query_text=feature_text,
-        top_k=top_k,
-    )
+
+    retriever = get_retriever()
+    
+    enable_decomposition = config.knowledge.query_decomposition
+    enable_expansion = config.knowledge.query_expansion
+    max_sub_queries = config.knowledge.max_sub_queries
+
+    # Truncate the feature text for retrieval (embedding models use ~256 tokens)
+    MAX_QUERY_CHARS = 1500
+    if len(feature_text) > MAX_QUERY_CHARS and not enable_decomposition:
+        query = feature_text[:MAX_QUERY_CHARS]
+        logger.info("Truncated retrieval query from %d to %d chars", len(feature_text), MAX_QUERY_CHARS)
+    else:
+        query = feature_text
+
+    use_transforms = enable_decomposition or enable_expansion
+    
+    if use_transforms:
+        transforms_desc = []
+        if enable_decomposition:
+            transforms_desc.append("decomposition")
+        if enable_expansion:
+            transforms_desc.append("expansion") 
+        logger.info("Running multi-query retrieval with %s (top_k=%s, max_sub_queries=%d)...",
+              ', '.join(transforms_desc), top_k, max_sub_queries)
+        
+        chunks = retriever.retrieve_multi_query(
+            feature_text=query,
+            top_k=top_k,
+            enable_decomposition=enable_decomposition,
+            enable_expansion=enable_expansion,
+            max_sub_queries=max_sub_queries,
+        )
+    else:
+        # Standard single-query retrieval
+        if len(query) > MAX_QUERY_CHARS:
+            query = query[:MAX_QUERY_CHARS]
+            logger.info("Truncated retrieval query to %d chars", MAX_QUERY_CHARS)
+        logger.info("Running hybrid retrieval (top_k=%s)...", top_k)
+        chunks = retriever.retrieve(
+            query_text=query,
+            top_k=top_k,
+        )
+    
+    logger.info("Retrieved %d knowledge chunks", len(chunks))
 
     if not chunks:
-        return ""
+        return [""]
 
     context_blocks = []
-
     for idx, chunk in enumerate(chunks, start=1):
         context_blocks.append(
             f"[Context {idx}]\n{chunk.text}"
         )
 
-    return "\n\n".join(context_blocks)
+    total_chars = sum(len(b) for b in context_blocks)
+    budget = _compute_kb_budget()
+    logger.info("KB context: %d chars total, budget per batch: %d chars", total_chars, budget)
+
+    batches = _batch_context_strings(context_blocks, budget)
+    logger.info("Split KB context into %d batch(es)", len(batches))
+    return batches
 
 
 def _build_prompt(
@@ -92,13 +226,14 @@ def _condense_chunk(chunk: str, model: str) -> str:
     """
     Reduce a document chunk to concise, test relevant bullet points.
     """
-    print(f"INFO: Processing chunk ({len(chunk)} chars)...")
+    logger.info("Condensing chunk (%d chars)... sending to LLM", len(chunk))
     prompt = build_condensation_prompt(chunk)
 
     try:
         condensed = llm_client.generate(prompt, model, json_mode=False)
+        logger.info("Condensation complete (%d chars returned)", len(condensed))
     except Exception as e:
-         print(f"DEBUG: LLM Error: {e}")
+         logger.debug("LLM Error: %s", e)
          raise GenerationError(f"Chunk condensation failed: {str(e)}")
 
     if not condensed:
@@ -141,16 +276,15 @@ def _normalize_test_cases(result) -> list[dict]:
             if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
                 return [item for item in value if isinstance(item, dict)]
 
-    # Debug: print what we received
-    print(f"DEBUG: Cannot normalize result of type {type(result).__name__}")
+    logger.debug("Cannot normalize result of type %s", type(result).__name__)
     if isinstance(result, dict):
-        print(f"DEBUG: Dict keys: {list(result.keys())[:5]}")
+        logger.debug("Dict keys: %s", list(result.keys())[:5])
     elif isinstance(result, list) and len(result) > 0:
-        print(f"DEBUG: List item types: {[type(x).__name__ for x in result[:3]]}")
+        logger.debug("List item types: %s", [type(x).__name__ for x in result[:3]])
     
     # Fallback: if we can't find anything, return empty list instead of crashing
     # This assumes the chunk just had no testable content
-    print("DEBUG: Normalization failed, assuming 0 test cases for this chunk.")
+    logger.debug("Normalization failed, assuming 0 test cases for this chunk.")
     return []
 
 
@@ -212,39 +346,40 @@ def _generate_single_suite(
 ) -> list[dict]:
     last_error: Exception | None = None
 
-    for _ in range(max_retries + 1):
-        print(f"INFO: Generating tests (attempt {_ + 1})...")
+    for attempt in range(max_retries + 1):
+        logger.info("Generating tests (attempt %d/%d)... sending to LLM", attempt + 1, max_retries + 1)
         try:
             result = llm_client.generate(prompt, model, json_mode=True)
+            logger.info("LLM response received (%s chars)", len(result) if isinstance(result, str) else 'parsed')
         except Exception as exc:
-            print(f"DEBUG: Generate Error: {exc}")
+            logger.debug("Generate Error: %s", exc)
             last_error = exc
             continue
 
         # Compatibility check: if result is empty string, retry
         if not result:
-            print("DEBUG: Empty result from LLM")
+            logger.debug("Empty result from LLM")
             last_error = GenerationError("Empty model output")
             continue
 
         if isinstance(result, str):
             result = result.strip()
             if not result:
-                print("DEBUG: Empty result string")
+                logger.debug("Empty result string")
                 last_error = GenerationError("Empty model output")
                 continue
             try:
                 result = _clean_json_output(result)
                 result = json.loads(result)
             except json.JSONDecodeError as exc:
-                print(f"DEBUG: JSON Decode Error: {exc} | Text: {result[:50]}...")
+                logger.debug("JSON Decode Error: %s | Text: %s...", exc, result[:50])
                 last_error = exc
                 continue
 
         try:
             test_cases = _normalize_test_cases(result)
         except GenerationError as exc:
-            print(f"DEBUG: Normalization Error: {exc}")
+            logger.debug("Normalization Error: %s", exc)
             last_error = exc
             continue
 
@@ -255,55 +390,162 @@ def _generate_single_suite(
     ) from last_error
 
 
+def _condense_kb_batch(batch: str, model: str, batch_idx: int, total: int) -> str:
+    """
+    Condense a KB context batch into focused bullet points.
+    Reuses the same condensation prompt as feature chunks since the goal
+    is identical: extract test-relevant facts.
+
+    Returns the condensed text, or the original if condensation fails
+    (so we never silently lose context).
+    """
+    if not batch or not batch.strip():
+        return ""
+    try:
+        logger.info("    Condensing KB batch %d/%d (%d chars)...", batch_idx + 1, total, len(batch))
+        condensed = _condense_chunk(batch, model)
+        ratio = len(condensed) / len(batch) * 100
+        logger.info("    KB batch %d condensed: %d → %d chars (%.0f%%)",
+              batch_idx + 1, len(batch), len(condensed), ratio)
+        return condensed
+    except GenerationError:
+        # Condensation failed — fall back to raw context rather than losing it
+        logger.warning("KB batch %d condensation failed, using raw context", batch_idx + 1)
+        return batch
+
+
 def _process_single_chunk(
     index: int,
     chunk: str,
     model: str,
     max_retries: int,
-    product_context: str,
+    product_context_batches: List[str],
     app_type: str,
 ) -> List[dict]:
     """
-    Process a single chunk: condense, build prompt, generate test cases.
-    Designed to be called in parallel.
-    """
-    condensed = _condense_chunk(chunk, model)
-    chunk_prompt = _build_prompt(
-        feature_chunks=[condensed],
-        product_context=product_context,
-        app_type=app_type
-    )
+    Process a single feature-doc chunk with enhanced RAG:
 
-    try:
-        return _generate_single_suite(
-            prompt=chunk_prompt,
-            model=model,
-            max_retries=max_retries,
+    1. Condense the feature chunk once.
+    2. Condense each KB context batch (compress ~3-5x).
+    3. Re-batch the condensed KB context (fewer, denser batches).
+    4. Generate test cases against each re-batched KB context.
+
+    This ensures no knowledge is lost while dramatically reducing
+    the number of LLM generation calls.
+    """
+    logger.info("=== Processing chunk %d ===", index + 1)
+    condensed_feature = _condense_chunk(chunk, model)
+
+    # --- KB Condensation ---
+    num_raw_batches = len(product_context_batches)
+    if num_raw_batches > 0 and product_context_batches != [""]:
+        logger.info("  Condensing %d KB batch(es) for chunk %d...", num_raw_batches, index + 1)
+        condensed_kb_blocks = []
+        for i, kb_batch in enumerate(product_context_batches):
+            condensed = _condense_kb_batch(kb_batch, model, i, num_raw_batches)
+            if condensed.strip():
+                condensed_kb_blocks.append(condensed)
+
+        # Re-batch the condensed KB (it's now much smaller)
+        if condensed_kb_blocks:
+            budget = _compute_kb_budget()
+            final_batches = _batch_context_strings(condensed_kb_blocks, budget)
+            total_condensed = sum(len(b) for b in condensed_kb_blocks)
+            logger.info("  KB condensation complete: %d raw batch(es) → %d generation batch(es) (%d chars)",
+                  num_raw_batches, len(final_batches), total_condensed)
+        else:
+            final_batches = [""]
+    else:
+        final_batches = [""]
+
+    # --- Test Case Generation ---
+    all_cases: List[dict] = []
+    num_gen_batches = len(final_batches)
+
+    for batch_idx, ctx_batch in enumerate(final_batches):
+        if num_gen_batches > 1:
+            logger.info("  Chunk %d — generation batch %d/%d", index + 1, batch_idx + 1, num_gen_batches)
+
+        chunk_prompt = _build_prompt(
+            feature_chunks=[condensed_feature],
+            product_context=ctx_batch,
+            app_type=app_type,
         )
-    except GenerationError as exc:
+
+        try:
+            cases = _generate_single_suite(
+                prompt=chunk_prompt,
+                model=model,
+                max_retries=max_retries,
+            )
+            all_cases.extend(cases)
+        except GenerationError as exc:
+            logger.warning("Generation failed for chunk %d, batch %d: %s", index + 1, batch_idx + 1, exc)
+
+    if not all_cases:
         raise GenerationError(
-            f"Failed to generate test cases for chunk {index}"
-        ) from exc
+            f"Failed to generate test cases for chunk {index} across all KB batches"
+        )
+
+    # --- Min-cases-per-chunk re-generation ---
+    from core.config import config
+    min_required = config.generation.min_cases_per_chunk
+    if min_required > 0 and len(all_cases) < min_required:
+        logger.info("  Chunk %d produced %d cases (below min %d). Re-generating with emphasis on completeness...",
+              index + 1, len(all_cases), min_required)
+        # Build a supplementary prompt asking for MORE cases
+        supplement_prompt = _build_prompt(
+            feature_chunks=[condensed_feature],
+            product_context=final_batches[0] if final_batches else "",
+            app_type=app_type,
+        )
+        # Prepend instruction to generate additional/missing cases
+        supplement_prompt = (
+            "IMPORTANT: The previous generation produced too few test cases. "
+            "You MUST generate MORE test cases covering additional scenarios: "
+            "negative cases, boundary values, error handling, edge cases, "
+            "input validation, state transitions, and integration points. "
+            "Generate at least " + str(min_required - len(all_cases)) + " additional unique test cases.\n\n"
+            + supplement_prompt
+        )
+        try:
+            extra_cases = _generate_single_suite(
+                prompt=supplement_prompt,
+                model=model,
+                max_retries=max_retries,
+            )
+            if extra_cases:
+                logger.info("  Re-generation added %d more cases for chunk %d", len(extra_cases), index + 1)
+                all_cases.extend(extra_cases)
+        except GenerationError as exc:
+            logger.warning("Re-generation failed for chunk %d: %s", index + 1, exc)
+
+    return all_cases
 
 
 def _generate_from_chunks(
     chunks: List[str],
     model: str,
     max_retries: int,
-    product_context: str = "",
+    per_chunk_kb_batches: Optional[List[List[str]]] = None,
     app_type: str = "web",
     max_workers: int = 4,
 ) -> List[dict]:
     """
-    Generate test cases for each chunk in parallel using threads.
+    Generate test cases for each feature-doc chunk in parallel using threads.
+
+    Each chunk receives its own KB context batches (per-chunk retrieval)
+    so the knowledge context is relevant to that specific chunk.
     LLM calls are I/O-bound so threading provides near-linear speedup.
     """
+    if per_chunk_kb_batches is None:
+        per_chunk_kb_batches = [[""]] * len(chunks)
+
     all_test_cases: List[dict] = []
 
     if len(chunks) == 1:
-        # No need for thread overhead with a single chunk
         return _process_single_chunk(
-            0, chunks[0], model, max_retries, product_context, app_type
+            0, chunks[0], model, max_retries, per_chunk_kb_batches[0], app_type
         )
 
     # Use ThreadPoolExecutor for parallel I/O-bound LLM calls
@@ -311,26 +553,29 @@ def _generate_from_chunks(
         future_to_index = {
             executor.submit(
                 _process_single_chunk,
-                index, chunk, model, max_retries, product_context, app_type
+                index, chunk, model, max_retries,
+                per_chunk_kb_batches[index], app_type
             ): index
             for index, chunk in enumerate(chunks)
         }
 
-        # Collect results in original chunk order
+        # Collect results in original chunk order with progress bar
         results_by_index = {}
-        for future in as_completed(future_to_index):
+        pbar = tqdm(
+            as_completed(future_to_index),
+            total=len(chunks),
+            desc="Generating test cases",
+            unit="chunk"
+        )
+        for future in pbar:
             index = future_to_index[future]
             results_by_index[index] = future.result()  # Re-raises exceptions
+        pbar.close()
 
         for i in sorted(results_by_index.keys()):
             all_test_cases.extend(results_by_index[i])
 
     return all_test_cases
-
-def _normalize_text(value: str) -> str:
-    if value is None:
-        return ""
-    return " ".join(value.lower().split())
 
 
 def _sanitize_test_cases(test_cases: list[dict]) -> list[dict]:
@@ -440,7 +685,7 @@ def _deduplicate_test_cases(
         deduplicated.append(case)
 
     if duplicates_found > 0:
-        print(f"DEBUG: Exact deduplication removed {duplicates_found} duplicates")
+        logger.info("Exact deduplication removed %d duplicates", duplicates_found)
     
     return deduplicated
 
@@ -449,7 +694,7 @@ def _deduplicate_test_cases(
 def _deduplicate_semantically(
     test_cases: list[dict],
     threshold: float = 0.85,
-    _cached_embeddings: list = None,
+    _cached_embeddings: Optional[list] = None,
 ) -> tuple[list[dict], list]:
     """
     Remove semantically similar test cases using embeddings.
@@ -551,7 +796,7 @@ def _review_test_suite(
         if "source_document" not in improved_suite_dict:
             improved_suite_dict["source_document"] = suite.source_document
             
-        return TestSuite.parse_obj(improved_suite_dict)
+        return TestSuite.model_validate(improved_suite_dict)
         
     except Exception:
         # If review fails, return original safe suite
@@ -561,19 +806,19 @@ def _review_test_suite(
 
 def _validate_dependencies(test_cases: List[dict]):
     """
-    Check if dependencies exist in the suite. Warn if missing.
+    Check if dependencies exist in the suite. Log warnings for missing deps.
     """
     existing_tests = {case.get("test_case") for case in test_cases if case.get("test_case")}
-    
+
     for case in test_cases:
         deps = case.get("dependencies", [])
         for dep in deps:
-            # We do a loose check (substring or exact match)
             if dep not in existing_tests:
-                # Try partial match logic? Or just warn.
-                # For now, just print to console as this is a CLI tool
-                pass 
-                # Ideally we would log this. For now let's just ensure the code runs.
+                logger.warning(
+                    "Test '%s' depends on '%s' which is not in the suite",
+                    case.get("test_case", "<unnamed>"),
+                    dep,
+                )
 
 def _clean_test_case_titles(test_cases: List[dict]) -> List[dict]:
     """
@@ -590,49 +835,6 @@ def _clean_test_case_titles(test_cases: List[dict]) -> List[dict]:
     return cleaned
 
 
-
-def _load_mobile_capabilities(file_path: str):
-    """
-    Load the mobile capabilities Excel file and return it as a DataFrame.
-    """
-    import pandas as pd
-    try:
-        return pd.read_excel(file_path)
-    except Exception as e:
-        print(f"ERROR: Failed to load mobile capabilities file: {e}")
-        raise
-
-def _filter_capabilities_by_app_type(df, app_type: str):
-    """
-    Filter the capabilities DataFrame based on the app type (Android/iOS).
-    """
-    if app_type == "android":
-        return df[["Capabilities", "Android", "Supported Attributes - Android", "Yet to Support - Android", "Remarks"]]
-    elif app_type == "ios":
-        return df[["Capabilities", "iOS", "Supported Attributes - iOS", "Yet to Support - iOS", "Remarks"]]
-    else:
-        raise ValueError(f"Unsupported app type: {app_type}")
-
-def _apply_mobile_capabilities(feature_text: str, app_type: str, file_path: str) -> str:
-    """
-    Cross-reference the feature text with mobile capabilities and return filtered context.
-    """
-    import pandas as pd
-    df = _load_mobile_capabilities(file_path)
-    filtered_df = _filter_capabilities_by_app_type(df, app_type)
-
-    # Generate a summary of supported and unsupported attributes
-    summary = []
-    for _, row in filtered_df.iterrows():
-        capability = row["Capabilities"]
-        supported = row[f"Supported Attributes - {app_type.capitalize()}"]
-        yet_to_support = row[f"Yet to Support - {app_type.capitalize()}"]
-        remarks = row["Remarks"]
-
-        summary.append(f"Capability: {capability}\nSupported: {supported}\nYet to Support: {yet_to_support}\nRemarks: {remarks}\n")
-
-    return "\n".join(summary)
-
 def generate_test_suite(
     file_path: str,
     model: Optional[str] = None,  # Uses config.general.model if None
@@ -640,36 +842,86 @@ def generate_test_suite(
     dedup_semantic: bool = True,
     reviewer_pass: bool = False,
     app_type: Optional[str] = None, # If None, uses config default
+    progress: Optional[Callable[[str, str], None]] = None,
 ) -> TestSuite:
     """
     Generate a TestSuite using chunk wise generation.
+
+    Args:
+        progress: Optional callback ``(stage, message)`` invoked at each
+                  major pipeline stage so callers (e.g. VS Code extension)
+                  can surface real-time progress to the user.
     """
     from core.config import config
     from pathlib import Path
+
+    def _progress(stage: str, msg: str) -> None:
+        if progress:
+            progress(stage, msg)
     
     # Use configured model if not explicitly provided
     if model is None:
         model = config.general.model
+    
+    # Resolve effective context window (auto-detect + cap)
+    effective_ctx = llm_client.get_effective_context_window(model)
+    effective_max_out = llm_client.get_effective_max_output_tokens(model)
+    
+    logger.info("Config: chunk_size=%d, chunk_overlap=%d, model=%s, context_window=%d (max_cap=%d), "
+          "max_output_tokens=%d, top_k=%s, min_cases_per_chunk=%d",
+          config.generation.chunk_size, config.generation.chunk_overlap,
+          model, effective_ctx, config.general.max_context_window,
+          effective_max_out, config.quality.top_k, config.generation.min_cases_per_chunk)
     chunks = parse_document(
         file_path,
         chunk_size=config.generation.chunk_size,
         overlap=config.generation.chunk_overlap,
     )
+    total_chars = sum(len(c) for c in chunks)
+    logger.info("Document parsed: %d chunk(s), %d total chars", len(chunks), total_chars)
+    _progress("parsing", f"Document parsed — {len(chunks)} chunk(s), {total_chars:,} characters")
 
-    feature_text = "\n\n".join(chunks)
-    product_context = _retrieve_product_context(feature_text)
+    # --- Per-Chunk KB Retrieval ---
+    # Retrieve KB context separately for each feature chunk so the retriever
+    # ranks knowledge by relevance to THAT specific chunk (not the whole doc).
+    # Combined with max_kb_batches, only the most relevant context is kept.
+    max_kb_batches = config.quality.max_kb_batches
+    logger.info("Per-chunk KB retrieval (top_k=%s, max_kb_batches=%d)...", config.quality.top_k, max_kb_batches)
+    _progress("retrieval", f"Retrieving knowledge base context for {len(chunks)} chunk(s)…")
+
+    per_chunk_kb: List[List[str]] = []
+    total_kb_batches = 0
+    for i, chunk in enumerate(tqdm(chunks, desc="Retrieving KB context", unit="chunk")):
+        logger.debug("Retrieving KB context for chunk %d/%d...", i + 1, len(chunks))
+        batches = _retrieve_product_context(chunk)
+
+        # Apply max_kb_batches cap (batches are relevance-ordered)
+        if max_kb_batches > 0 and len(batches) > max_kb_batches:
+            logger.info("  Capping KB batches: %d → %d (most relevant)", len(batches), max_kb_batches)
+            batches = batches[:max_kb_batches]
+
+        per_chunk_kb.append(batches)
+        total_kb_batches += len(batches)
+
+    logger.info("Per-chunk retrieval complete: %d total KB batch(es) across %d chunk(s)", total_kb_batches, len(chunks))
+    _progress("retrieval_done", f"Knowledge retrieval complete — {total_kb_batches} context batch(es)")
 
     # Determine final parameters (Arg > Config)
     final_app_type = app_type if app_type else config.generation.app_type
 
-    # Generate test cases from chunks (parallel, with RAG context)
+    # Generate test cases (parallel across feature chunks, sequential KB condensation + generation)
+    logger.info("Starting enhanced RAG pipeline: %d chunk(s), %d KB batch(es) to condense + generate using model '%s'...",
+          len(chunks), total_kb_batches, model)
+    _progress("generating", f"Generating test cases from {len(chunks)} chunk(s) using {model}…")
     raw_test_cases = _generate_from_chunks(
         chunks=chunks,
         model=model,
         max_retries=max_retries,
-        product_context=product_context,
-        app_type=final_app_type
+        per_chunk_kb_batches=per_chunk_kb,
+        app_type=final_app_type,
     )
+    logger.info("Raw generation complete: %d test cases from all chunks", len(raw_test_cases))
+    _progress("post_processing", f"Post-processing {len(raw_test_cases)} raw test cases…")
 
 
     merged_suite = {
@@ -691,16 +943,18 @@ def generate_test_suite(
     
     _cached_emb = None
     if dedup_semantic:
+        _progress("deduplication", "Running semantic deduplication…")
         merged_suite["test_cases"], _cached_emb = _deduplicate_semantically(
             merged_suite["test_cases"],
-            threshold=0.90  # Stricter threshold
+            threshold=config.quality.similarity_threshold
         )
 
     # 3. Checklist Cross-Reference Pass
     input_path = Path(file_path)
     checklist_path = input_path.parent / f"{input_path.stem}_checklist.txt"
     if checklist_path.exists():
-        print(f"[INFO] Found supporting checklist: {checklist_path.name}. Cross-referencing...")
+        logger.info("Found supporting checklist: %s. Cross-referencing...", checklist_path.name)
+        _progress("cross_reference", f"Cross-referencing with checklist {checklist_path.name}…")
         try:
             with open(checklist_path, "r", encoding="utf-8") as f:
                 checklist_text = f.read()
@@ -718,7 +972,7 @@ def generate_test_suite(
             )
             
             if missing_cases:
-                print(f"[SUCCESS] Cross-reference generated {len(missing_cases)} additional test cases.")
+                logger.info("Cross-reference generated %d additional test cases.", len(missing_cases))
                 missing_cases = _sanitize_test_cases(missing_cases)
                 missing_cases = _clean_test_case_titles(missing_cases)
                 merged_suite["test_cases"].extend(missing_cases)
@@ -728,13 +982,13 @@ def generate_test_suite(
                 if dedup_semantic:
                     merged_suite["test_cases"], _cached_emb = _deduplicate_semantically(
                         merged_suite["test_cases"],
-                        threshold=0.90,
+                        threshold=config.quality.similarity_threshold,
                         _cached_embeddings=_cached_emb,
                     )
             else:
-                print("[INFO] Cross-reference complete. No missing test cases identified.")
+                logger.info("Cross-reference complete. No missing test cases identified.")
         except Exception as e:
-            print(f"[WARNING] Checklist cross-reference failed: {e}. Proceeding with original suite.")
+            logger.warning("Checklist cross-reference failed: %s. Proceeding with original suite.", e)
     
     # 4. Prioritization
     merged_suite["test_cases"] = _prioritize_test_cases(
@@ -745,12 +999,14 @@ def generate_test_suite(
     _validate_dependencies(merged_suite["test_cases"])
 
     try:
-        final_suite = TestSuite.parse_obj(merged_suite)
+        final_suite = TestSuite.model_validate(merged_suite)
         
         # 3. Optional Reviewer Pass
         if reviewer_pass:
+            _progress("reviewing", "Running AI reviewer pass…")
             final_suite = _review_test_suite(final_suite, model)
-            
+
+        _progress("complete", f"Done — {len(final_suite.test_cases)} test cases ready")
         return final_suite
     except Exception as exc:
         raise GenerationError(

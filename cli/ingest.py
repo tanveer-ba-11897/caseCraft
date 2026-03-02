@@ -24,8 +24,7 @@ from core.knowledge.web_loader import (
     validate_url,
 )
 from core.knowledge.loader import load_documents
-from core.knowledge.chunker import chunk_document
-from core.knowledge.embedder import Embedder
+from core.knowledge.ingest import ingest_documents
 from core.config import load_config
 
 
@@ -50,73 +49,23 @@ def ingest_to_index(documents, index_path: str = "knowledge_base/index.json"):
     if not documents:
         print("[WARN] No documents to ingest")
         return
-    
-    print(f"[INFO] Processing {len(documents)} documents...")
-    
+
     # Load config for knowledge base chunk size
     cfg = load_config()
     kb_chunk_size = cfg.knowledge.kb_chunk_size
     print(f"[INFO] Using knowledge base chunk size: {kb_chunk_size} chars")
-    
-    # Chunk documents
-    all_chunks = []
-    for doc in documents:
-        chunks = chunk_document(doc, max_chars=kb_chunk_size)
-        all_chunks.extend(chunks)
-        print(f"[INFO] Chunked '{doc.source_name[:50]}...' into {len(chunks)} chunks")
-    
-    print(f"[INFO] Total chunks: {len(all_chunks)}")
-    
-    # Embed chunks
-    print("[INFO] Generating embeddings (this may take a while)...")
-    embedder = Embedder()
-    embedded_chunks = embedder.embed_chunks(all_chunks)
-    
-    # Load existing index if exists
-    index_file = Path(index_path)
-    existing_data = []
-    if index_file.exists():
-        with open(index_file, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-        # Validate index schema
-        required_keys = {"id", "text", "metadata", "embedding"}
-        if isinstance(raw_data, list):
-            existing_data = [
-                entry for entry in raw_data
-                if isinstance(entry, dict) and required_keys.issubset(entry.keys())
-            ]
-            skipped = len(raw_data) - len(existing_data)
-            if skipped:
-                print(f"[WARN] Skipped {skipped} invalid entries in index")
-        else:
-            print("[WARN] Invalid index format. Starting fresh.")
-            existing_data = []
-        print(f"[INFO] Loaded {len(existing_data)} existing entries from index")
-    
-    # Add new chunks
-    for chunk in embedded_chunks:
-        existing_data.append({
-            "id": chunk.id,
-            "text": chunk.text,
-            "metadata": chunk.metadata,
-            "embedding": chunk.embedding,
-        })
-    
-    # Save index
-    index_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(index_file, "w", encoding="utf-8") as f:
-        json.dump(existing_data, f, indent=2)
-    
-    # SEC-09: Restrict file permissions (owner read/write only)
-    import os
-    import platform
-    try:
-        os.chmod(index_file, 0o600)
-    except OSError:
-        if platform.system() == "Windows":
-            print("[WARN] Could not restrict file permissions on Windows. Consider setting permissions manually.")
-    
-    print(f"[SUCCESS] Saved {len(existing_data)} total entries to {index_path}")
+
+    def _print_progress(stage: str, msg: str) -> None:
+        print(f"[INFO] {msg}")
+
+    result = ingest_documents(
+        documents,
+        index_path,
+        kb_chunk_size=kb_chunk_size,
+        progress=_print_progress,
+    )
+
+    print(f"[SUCCESS] Saved {result.total_index_size} total entries to {index_path}")
 
 
 def cmd_ingest_sitemap(args):

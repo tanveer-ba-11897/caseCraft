@@ -11,23 +11,46 @@ general:
   # - "llama3.2:3b" (Fastest Local)
   model: "llama3.1:8b"
 
-  # Backend provider: "ollama" (native), "openai" (compatible servers), or "google" (Gemini)
+  # Backend provider:
+  #   "ollama"  — Local Ollama server (default)
+  #   "openai"  — OpenAI / Azure OpenAI / vLLM / LocalAI
+  #   "google"  — Google Gemini
+  #   "vscode"  — VS Code Copilot extension (no API key or base_url needed)
   llm_provider: "ollama"
   
   # API Endpoint
   # - Ollama: http://localhost:11434
   # - OpenAI/vLLM/LocalAI: http://localhost:8000/v1
   # - Google: https://generativelanguage.googleapis.com/v1beta
+  # - vscode: leave blank (uses native vscode.lm API)
   base_url: "http://localhost:11434"
   
   # API Key — NEVER put real keys here. Use env var CASECRAFT_GENERAL_API_KEY instead.
+  # - Ollama: "ollama" (no real key needed)
+  # - vscode: leave blank (authentication via GitHub Copilot subscription)
   api_key: "ollama"  # Default for local Ollama (no real key needed)
 
   # Context window size (num_ctx) — controls RAM usage.
-  # -1 = use model default (128K for llama3.2, needs ~16GB RAM!)
+  # -1 = auto-detect from model (recommended). Queries Ollama API.
   # 4096 = ~4GB RAM — safe for machines with 8-16GB.
   # 8192 = ~6GB RAM — better for larger documents.
   context_window_size: -1
+
+  # Maximum context window cap — auto-detected value will never exceed this.
+  # Prevents OOM on limited-RAM machines. Set -1 to disable cap.
+  max_context_window: 8192
+
+  # Auto-detect context window from the model (Ollama only).
+  auto_detect_context_window: true
+
+  # Max output tokens. -1 = auto-scale to 25% of context window.
+  max_output_tokens: -1
+
+  # Cap for auto-scaled output tokens. Only applies when max_output_tokens is -1.
+  max_output_tokens_cap: 4096
+
+  # Fraction of context window for output (0.05-0.5). Default 0.25 = 25%.
+  output_token_ratio: 0.25
 
   # Maximum number of retries if the LLM generates invalid JSON.
   max_retries: 2
@@ -51,6 +74,9 @@ generation:
   # The type of application being tested (web, mobile, desktop, api).
   # This configures the specific types of test cases generated.
   app_type: "web"
+
+  # Minimum test cases per chunk. Triggers re-generation if under this count.
+  min_cases_per_chunk: 5
 
 # --------------------------
 # Output Settings
@@ -77,3 +103,15 @@ quality:
   # Enable the Reviewer Pass (slow).
   # If true, an extra LLM call validates and polishes the test suite.
   reviewer_pass: true
+
+# --------------------------
+# Knowledge Base Settings
+# --------------------------
+knowledge:
+  kb_chunk_size: 1500
+  min_score_threshold: 0.1
+
+  # Query Transforms
+  query_decomposition: true   # Decompose into focused sub-queries
+  query_expansion: true        # Add domain synonyms for recall
+  max_sub_queries: 4           # Max sub-queries per retrieval

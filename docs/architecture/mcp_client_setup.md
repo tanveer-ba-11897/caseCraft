@@ -2,6 +2,7 @@
 # MCP Configuration Guide: AnythingLLM & Claude Desktop
 
 ## Overview
+
 CaseCraft runs as an **MCP Server** on your local machine using the `casecraft_mcp.py` script. The "Client" (AnythingLLM or Claude Desktop) simply needs to know **where that script is**.
 
 ---
@@ -15,18 +16,21 @@ CaseCraft runs as an **MCP Server** on your local machine using the `casecraft_m
 ### Step 1: Add the MCP Server
 
 **Option A: GUI (Easiest)**
-1.  Open AnythingLLM > **Settings** (gear icon).
-2.  Go to **Agent Skills** > **MCP Servers**.
-3.  Click **Add MCP Server**.
-4.  Fill in:
+
+1. Open AnythingLLM > **Settings** (gear icon).
+2. Go to **Agent Skills** > **MCP Servers**.
+3. Click **Add MCP Server**.
+4. Fill in:
     - **Name**: `CaseCraft`
     - **Command**: `python`
     - **Arguments**: `c:\Users\tanve\casecraft\casecraft_mcp.py`
-5.  Click **Save**. You should see `generate_tests` and `query_knowledge` listed as tools.
+5. Click **Save**. You should see `generate_tests` and `query_knowledge` listed as tools.
 
 **Option B: JSON (Advanced)**
-1.  Navigate to `%APPDATA%\anythingllm-desktop\storage\plugins\`.
-2.  Create or edit `anythingllm_mcp_servers.json`:
+
+1. Navigate to `%APPDATA%\anythingllm-desktop\storage\plugins\`.
+2. Create or edit `anythingllm_mcp_servers.json`:
+
 ```json
 {
   "mcpServers": {
@@ -38,18 +42,19 @@ CaseCraft runs as an **MCP Server** on your local machine using the `casecraft_m
   }
 }
 ```
-3.  Restart AnythingLLM.
+
+1. Restart AnythingLLM.
 
 ### Step 2: Create an Agent Workspace (Critical!)
 
-1.  Click **+ New Workspace**.
-2.  Name it (e.g., "QA Agent").
-3.  Open the workspace settings (gear icon on the workspace).
-4.  Change **Chat mode** from `Chat` to **`Agent`**.
-5.  Under **Agent Configuration**:
+1. Click **+ New Workspace**.
+2. Name it (e.g., "QA Agent").
+3. Open the workspace settings (gear icon on the workspace).
+4. Change **Chat mode** from `Chat` to **`Agent`**.
+5. Under **Agent Configuration**:
     - Ensure CaseCraft tools (`generate_tests`, `query_knowledge`) are **enabled/checked**.
     - Set the LLM model for the agent (e.g., `llama3.2:3b` via Ollama).
-6.  **Save** settings.
+6. **Save** settings.
 
 ### Step 3: Use the Right Prompt
 
@@ -57,6 +62,7 @@ In the Agent workspace, ask:
 > "Use the generate_tests tool to generate test cases for the file `examples/sample.pdf`"
 
 **Tips for triggering tool calls:**
+
 - Explicitly mention "use the generate_tests tool" in your prompt.
 - If the LLM still answers directly, try: "Call the CaseCraft generate_tests function with file_path examples/sample.pdf".
 - Check the response for a "Tool Call" indicator — this confirms MCP was used.
@@ -66,11 +72,13 @@ In the Agent workspace, ask:
 ---
 
 ## 2. Claude Desktop
+
 **How to Connect:**
-1.  Locate `claude_desktop_config.json`:
-    *   **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-    *   (Typically `C:\Users\tanve\AppData\Roaming\Claude\claude_desktop_config.json`)
-2.  Add this JSON snippet:
+
+1. Locate `claude_desktop_config.json`:
+    - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+    - (Typically `C:\Users\tanve\AppData\Roaming\Claude\claude_desktop_config.json`)
+2. Add this JSON snippet:
 
 ```json
 {
@@ -85,16 +93,18 @@ In the Agent workspace, ask:
 }
 ```
 
-3.  Restart Claude Desktop. The 🔨 icon will appear in chat.
+1. Restart Claude Desktop. The 🔨 icon will appear in chat.
 
 ---
 
 ## 3. Switching Between Them
+
 **Zero Code Changes Required.**
 You can have **both** configured at the same time. The CaseCraft server doesn't care who calls it.
-*   Want to use AnythingLLM? Open AnythingLLM.
-*   Want to use Claude? Open Claude.
-*   Want to switch? Just close one app and open the other.
+
+- Want to use AnythingLLM? Open AnythingLLM.
+- Want to use Claude? Open Claude.
+- Want to switch? Just close one app and open the other.
 
 **Tip**: The only difference is the *Client Configuration* (JSON file vs GUI settings). The server logic `casecraft_mcp.py` remains identical.
 
@@ -105,7 +115,9 @@ You can have **both** configured at the same time. The CaseCraft server doesn't 
 Currently, the MCP Server is **Read-Only** for generation and querying. To manage the Knowledge Base (add/remove docs), you must use the **CLI**.
 
 ### Ingesting New Docs
+
 To add new documentation to the RAG index from your terminal:
+
 ```bash
 # Add a Sitemap
 python -m cli.ingest sitemap https://docs.example.com/sitemap.xml
@@ -115,16 +127,20 @@ python -m cli.ingest docs ./new-specs/
 ```
 
 ### Clearing the Knowledge Base
+
 To wipe the index and start fresh (e.g., for a new project):
-1.  **Stop the MCP Server** (Close Claude/AnythingLLM or stop the python process).
-2.  **Delete the Index Files**:
+
+1. **Stop the MCP Server** (Close Claude/AnythingLLM or stop the python process).
+2. **Delete the Index Files**:
+
     ```bash
     # Windows Command Prompt
     del knowledge_base\index.json
-    rmdir /s /q knowledge_base\chroma
+    del knowledge_base\index.json.sha256
     ```
-3.  **Re-ingest** your new documents.
-4.  **Restart** your AI Client.
+
+3. **Re-ingest** your new documents.
+4. **Restart** your AI Client.
 
 ---
 
@@ -139,10 +155,11 @@ model requires more system memory (15.9 GiB) than is available (9.1 GiB)
 ```
 
 **✅ Correct Workflow:**
-1.  Save your PRD/spec file in the `examples/` folder (or `specs/` or `docs/`).
-2.  In the chat, ask:
+
+1. Save your PRD/spec file in the `examples/` folder (or `specs/` or `docs/`).
+2. In the chat, ask:
     > "Generate test cases for the file `examples/my_feature.pdf`"
-3.  The agent will call CaseCraft's `generate_tests` tool, which reads and chunks the file internally — no memory issues.
+3. The agent will call CaseCraft's `generate_tests` tool, which reads and chunks the file internally — no memory issues.
 
 ---
 

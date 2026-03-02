@@ -8,6 +8,7 @@ Supports:
 - Clean HTML to text extraction
 """
 
+import logging
 import time
 import ipaddress
 import socket
@@ -20,6 +21,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from core.knowledge.models import RawDocument
+
+logger = logging.getLogger("casecraft.web_loader")
 
 
 # ─── Security: URL Validation (SSRF Prevention) ─────────────────────────────
@@ -177,7 +180,7 @@ def _parse_sitemap(sitemap_url: str, config: CrawlConfig) -> List[str]:
     try:
         content = _fetch_url(sitemap_url, config)
     except WebLoaderError as e:
-        print(f"[WARN] Could not fetch sitemap: {e}")
+        logger.warning("Could not fetch sitemap: %s", e)
         return urls
     
     try:
@@ -193,7 +196,7 @@ def _parse_sitemap(sitemap_url: str, config: CrawlConfig) -> List[str]:
     # Check if this is a sitemap index
     sitemap_tags = root.findall(f".//{namespace}sitemap")
     if sitemap_tags:
-        print(f"[INFO] Found sitemap index with {len(sitemap_tags)} sitemaps")
+        logger.info("Found sitemap index with %d sitemaps", len(sitemap_tags))
         for sitemap in sitemap_tags:
             loc = sitemap.find(f"{namespace}loc")
             if loc is not None and loc.text:
@@ -238,11 +241,11 @@ def load_from_sitemap(
     if config is None:
         config = CrawlConfig()
     
-    print(f"[INFO] Parsing sitemap: {sitemap_url}")
+    logger.info("Parsing sitemap: %s", sitemap_url)
     urls = _parse_sitemap(sitemap_url, config)
     
     if not urls:
-        print("[WARN] No URLs found in sitemap")
+        logger.warning("No URLs found in sitemap")
         return []
     
     # Filter and limit URLs
@@ -252,14 +255,14 @@ def load_from_sitemap(
             continue
         filtered_urls.append(url)
         if len(filtered_urls) >= config.max_pages:
-            print(f"[WARN] Reached max_pages limit ({config.max_pages})")
+            logger.warning("Reached max_pages limit (%d)", config.max_pages)
             break
     
-    print(f"[INFO] Found {len(filtered_urls)} pages to crawl")
+    logger.info("Found %d pages to crawl", len(filtered_urls))
     
     documents = []
     for i, url in enumerate(filtered_urls):
-        print(f"[INFO] Crawling [{i+1}/{len(filtered_urls)}]: {url}")
+        logger.info("Crawling [%d/%d]: %s", i+1, len(filtered_urls), url)
         
         try:
             html = _fetch_url(url, config)
@@ -276,19 +279,19 @@ def load_from_sitemap(
                     source_name=source_name[:100],  # Limit length
                     source_type="web_doc",
                 ))
-                print(f"[OK] Extracted {len(text)} chars")
+                logger.info("Extracted %d chars", len(text))
             else:
-                print(f"[SKIP] No content extracted")
+                logger.info("No content extracted (skipped)")
                 
         except WebLoaderError as e:
-            print(f"[ERROR] {e}")
+            logger.error("%s", e)
             continue
         
         # Rate limiting
         if i < len(filtered_urls) - 1:
             time.sleep(config.delay_between_requests)
     
-    print(f"[INFO] Successfully loaded {len(documents)} documents")
+    logger.info("Successfully loaded %d documents", len(documents))
     return documents
 
 
@@ -342,14 +345,14 @@ def load_from_url_list(
     
     documents = []
     for i, url in enumerate(urls):
-        print(f"[INFO] Loading [{i+1}/{len(urls)}]: {url}")
+        logger.info("Loading [%d/%d]: %s", i+1, len(urls), url)
         
         try:
             doc = load_from_url(url, config)
             documents.append(doc)
-            print(f"[OK] Extracted {len(doc.text)} chars")
+            logger.info("Extracted %d chars", len(doc.text))
         except WebLoaderError as e:
-            print(f"[ERROR] {e}")
+            logger.error("%s", e)
             continue
         
         if i < len(urls) - 1:

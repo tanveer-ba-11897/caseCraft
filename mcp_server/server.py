@@ -144,6 +144,13 @@ def generate_tests(file_path: str, app_type: str = None) -> str:
         _exporter.export(suite, "json", str(json_path))
         _exporter.export(suite, "excel", str(excel_path))
         
+        # Unload model from Ollama memory to free resources
+        try:
+            from core.llm_client import llm_client
+            llm_client.unload_model(_config.general.model)
+        except Exception:
+            pass
+        
         return (
             f"Successfully generated {len(suite.test_cases)} test cases.\n"
             f"Saved to:\n"

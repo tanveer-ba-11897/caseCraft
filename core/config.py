@@ -1,9 +1,12 @@
 
+import logging
 import os
 import yaml
 from typing import Optional
 from pathlib import Path
 from pydantic import BaseModel, Field, SecretStr, ConfigDict
+
+logger = logging.getLogger("casecraft.config")
 
 # Constants
 CONFIG_FILE_NAME = "casecraft.yaml"
@@ -17,8 +20,12 @@ class GeneralSettings(BaseModel):
     api_key: SecretStr = Field(default="ollama", description="API Key (if required)")
     timeout: int = Field(600, description="Request timeout in seconds")
     max_retries: int = Field(2, description="Max retries for JSON generation")
-    context_window_size: int = Field(-1, description="Context window size (num_ctx). Set to -1 to use model default/max.")
-    max_output_tokens: int = Field(4096, description="Max tokens to generate")
+    context_window_size: int = Field(-1, description="Context window size (num_ctx). Set to -1 for auto-detect from model.")
+    max_context_window: int = Field(32768, description="Maximum context window cap. Auto-detected values are clamped to this limit.")
+    auto_detect_context_window: bool = Field(True, description="Auto-detect model context window from Ollama API.")
+    max_output_tokens: int = Field(-1, description="Max tokens to generate. -1 = auto-scale based on context window.")
+    max_output_tokens_cap: int = Field(8192, description="Upper cap for auto-scaled output tokens. Prevents excessively long responses.")
+    output_token_ratio: float = Field(0.25, description="Fraction of context window allocated to output when max_output_tokens is -1 (0.0-0.5).")
 
 class GenerationSettings(BaseModel):
     chunk_size: int = Field(1000, description="Document chunk size")
@@ -26,6 +33,7 @@ class GenerationSettings(BaseModel):
     temperature: float = Field(0.2, description="Model temperature")
     top_p: float = Field(0.5, description="Nucleus sampling (creativity range)")
     app_type: str = Field("web", description="Application type: web, mobile, desktop, api")
+    min_cases_per_chunk: int = Field(5, description="Minimum test cases expected per chunk. Triggers re-generation if under this count.")
 
 class OutputSettings(BaseModel):
     default_format: str = Field("excel", description="Default output format (excel/json)")
@@ -34,12 +42,16 @@ class OutputSettings(BaseModel):
 class KnowledgeSettings(BaseModel):
     kb_chunk_size: int = Field(1500, description="Max characters per knowledge base chunk during ingestion")
     min_score_threshold: float = Field(0.1, description="Minimum hybrid score to include a retrieval result (0.0 - 1.0). Lower = more results.")
+    query_decomposition: bool = Field(True, description="Decompose long queries into focused sub-queries for better retrieval")
+    query_expansion: bool = Field(True, description="Expand queries with domain synonyms for improved recall")
+    max_sub_queries: int = Field(4, description="Maximum sub-queries when decomposition is enabled")
 
 class QualitySettings(BaseModel):
     semantic_deduplication: bool = Field(True, description="Enable semantic deduplication")
     similarity_threshold: float = Field(0.85, description="Similarity threshold for deduplication")
     reviewer_pass: bool = Field(False, description="Enable AI reviewer pass")
     top_k: int = Field(5, description="Number of context chunks to retrieve. Set to -1 to retrieve ALL chunks.")
+    max_kb_batches: int = Field(10, description="Max KB context batches to process per feature chunk. Batches are ordered by relevance, so this keeps only the most useful context. Set to -1 for unlimited.")
 
 class CaseCraftConfig(BaseModel):
     general: GeneralSettings = Field(default_factory=GeneralSettings)
@@ -69,12 +81,12 @@ def load_config(config_path: Optional[str] = None) -> CaseCraftConfig:
             with open(path, "r", encoding="utf-8") as f:
                 config_data = yaml.safe_load(f) or {}
         except Exception as e:
-            print(f"Warning: Failed to load config file: {e}")
+            logger.warning("Failed to load config file: %s", e)
 
     # Warn if API key is stored in config file instead of env var
     yaml_api_key = config_data.get("general", {}).get("api_key")
     if yaml_api_key and yaml_api_key != "ollama":
-        print("WARNING: API key detected in config file. Use env var CASECRAFT_GENERAL_API_KEY instead for security.")
+        logger.warning("API key detected in config file. Use env var CASECRAFT_GENERAL_API_KEY instead for security.")
 
     # 3. Load from Environment Variables (Override YAML)
     # Convention: CASECRAFT_SECTION_KEY (e.g., CASECRAFT_GENERAL_MODEL)

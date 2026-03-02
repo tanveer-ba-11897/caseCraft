@@ -1,5 +1,13 @@
-from typing import List, Dict, Optional, Any
-from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any, Literal
+from pydantic import BaseModel, Field, field_validator
+
+
+# Valid values for test_type and priority
+TestType = Literal[
+    "functionality", "ui", "performance", "integration",
+    "usability", "database", "security", "acceptance"
+]
+Priority = Literal["high", "medium", "low"]
 
 
 class TestCase(BaseModel):
@@ -17,7 +25,7 @@ class TestCase(BaseModel):
         description="Short descriptive name of the test case"
     )
 
-    test_type: str = Field(
+    test_type: TestType = Field(
         default="functionality",
         description="Type of test case: functionality, ui, performance, integration, usability, database, security, or acceptance"
     )
@@ -37,10 +45,36 @@ class TestCase(BaseModel):
         description="Step-by-step actions to execute the test"
     )
 
-    priority: str = Field(
+    priority: Priority = Field(
         ...,
         description="Priority of the test case: high, medium, or low"
     )
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, v: str) -> str:
+        """Normalize priority to lowercase. Defaults to 'medium' if invalid."""
+        if not isinstance(v, str):
+            return "medium"
+        normalized = v.strip().lower()
+        if normalized in ("high", "medium", "low"):
+            return normalized
+        return "medium"
+
+    @field_validator("test_type", mode="before")
+    @classmethod
+    def normalize_test_type(cls, v: str) -> str:
+        """Normalize test_type to lowercase. Defaults to 'functionality' if invalid."""
+        valid_types = {
+            "functionality", "ui", "performance", "integration",
+            "usability", "database", "security", "acceptance"
+        }
+        if not isinstance(v, str):
+            return "functionality"
+        normalized = v.strip().lower()
+        if normalized in valid_types:
+            return normalized
+        return "functionality"
 
     tags: List[str] = Field(
         default_factory=list,

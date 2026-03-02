@@ -1,5 +1,6 @@
 
 import argparse
+import logging
 import sys
 import os
 from pathlib import Path
@@ -10,6 +11,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.generator import generate_test_suite
 from core.exporter import export
 from core.config import load_config
+
+
+def _setup_logging(verbose: bool = False) -> None:
+    """Configure logging for the CLI. DEBUG level when --verbose, INFO otherwise."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -45,17 +58,19 @@ def main():
     args = parser.parse_args()
 
     if args.command == "generate":
+        _setup_logging(verbose=getattr(args, 'verbose', False))
         run_generate(args)
     else:
         parser.print_help()
 
 def run_generate(args):
+    logger = logging.getLogger("casecraft.cli")
     input_path = Path(args.file)
     if not input_path.exists():
-        print(f"Error: File not found: {input_path}")
+        logger.error("File not found: %s", input_path)
         sys.exit(1)
 
-    print(f"[CaseCraft] Starting for {input_path.name}")
+    logger.info("Starting CaseCraft for %s", input_path.name)
     # Resolve config priorities: CLI Args > Config File/Env
     config = load_config()
     
@@ -84,7 +99,7 @@ def run_generate(args):
         output_path = outputs_dir / f"{input_path.stem}_test_cases.{ext}"
 
     try:
-        print("[INFO] Parsing and generating test cases... (this may take a minute)")
+        logger.info("Parsing and generating test cases... (this may take a minute)")
         suite = generate_test_suite(
             str(input_path),
             model=model,
@@ -93,15 +108,19 @@ def run_generate(args):
             app_type=None  # Falls back to config
         )
         
-        print(f"[SUCCESS] Generation complete. Found {len(suite.test_cases)} test cases.")
+        logger.info("Generation complete. Found %d test cases.", len(suite.test_cases))
         
-        print(f"[INFO] Exporting to {output_path}...")
+        logger.info("Exporting to %s...", output_path)
         export(suite, fmt_str, str(output_path))
         
-        print(f"[DONE] Output saved to {output_path}.")
+        logger.info("Output saved to %s", output_path)
+        
+        # Unload the model from Ollama memory to free resources
+        from core.llm_client import llm_client
+        llm_client.unload_model(model)
         
     except Exception as e:
-        print(f"\n[ERROR] {str(e)}")
+        logger.error("%s", e)
         if args.verbose:
             import traceback
             traceback.print_exc()
