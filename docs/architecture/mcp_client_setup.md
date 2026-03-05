@@ -168,7 +168,7 @@ model requires more system memory (15.9 GiB) than is available (9.1 GiB)
 | Error | Cause | Fix |
 |:------|:------|:----|
 | **Error -32000: Connection closed** | Server takes too long to start | CaseCraft uses lazy imports — ensure you're on the latest `server.py`. |
-| **Model requires more system memory** | Context window too large for RAM | Set `context_window_size: 4096` in `casecraft.yaml`. |
+| **Model requires more system memory** | Context window too large for RAM | Set `context_window_ratio: 0.5` in `casecraft.yaml` to use only 50% of the native window. |
 | **Memory error after config change** | Large doc pasted into chat | Don't paste docs — save as file in `examples/` and reference by path. |
 | **Server not found** | Python path wrong | Ensure `python` points to the venv with deps installed. Use full path if needed. |
 | **Error -32001: Request Timeout** | Generation took too long (>60s) | 1. Use a faster local model (`llama3.2:3b`).<br>2. Retry (first run is slower due to model loading).<br>3. Split large PDF into smaller files. |

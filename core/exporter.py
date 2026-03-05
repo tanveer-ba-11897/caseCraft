@@ -34,8 +34,11 @@ def _validate_output_path(output_path: str) -> str:
     return str(abs_path)
 
 
-def _join_lines(items: List[str]) -> str:
-    return "\n".join(items) if items else ""
+def _join_lines(items: List) -> str:
+    """Join list items with newlines, coercing non-strings to str."""
+    if not items:
+        return ""
+    return "\n".join(str(item) if not isinstance(item, str) else item for item in items)
 
 
 def _export_excel(suite: TestSuite, output_path: str) -> None:

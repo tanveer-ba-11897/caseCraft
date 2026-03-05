@@ -172,6 +172,22 @@ class VectorStore:
             kwargs["where"] = where
         return self.collection.query(**kwargs)
 
+    def get_by_ids(
+        self,
+        ids: List[str],
+        include: Optional[Include] = None,
+    ) -> GetResult:
+        """
+        Fetch specific chunks by their IDs.
+
+        Used by the retriever to expand child → parent chunks.
+        """
+        if not ids:
+            return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}  # type: ignore[typeddict-item]
+        if include is None:
+            include = ["documents", "metadatas"]
+        return self.collection.get(ids=ids, include=include)
+
     def get_all(
         self,
         include: Optional[Include] = None,

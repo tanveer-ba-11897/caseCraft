@@ -182,6 +182,124 @@ def chunk_text(
     return chunks
 
 
+# ── Recursive Character Splitter ──────────────────────────────────────────
+
+# Separator hierarchy from coarsest to finest
+_RECURSIVE_SEPARATORS = [
+    "\n\n",  # Paragraph break
+    "\n",    # Line break
+    ". ",    # Sentence end
+    "; ",    # Clause separator
+    ", ",    # Phrase separator
+    " ",     # Word boundary
+    "",      # Character (last resort)
+]
+
+
+def recursive_chunk_text(
+    text: str,
+    chunk_size: int = 1000,
+    overlap: int = 100,
+    separators: List[str] | None = None,
+    _depth: int = 0,
+) -> List[str]:
+    """
+    Recursively split text using progressively finer separators.
+
+    Tries the coarsest separator first (``\\n\\n``).  For any resulting
+    piece that still exceeds *chunk_size*, it recurses with the next
+    finer separator.  This produces chunks that respect document
+    structure (paragraphs > lines > sentences > words) as deeply as
+    possible while staying within the size budget.
+
+    Parameters
+    ----------
+    text:
+        Text to split.
+    chunk_size:
+        Maximum characters per chunk.
+    overlap:
+        Characters of overlap between adjacent chunks at the same level.
+    separators:
+        Ordered list of separators to try (coarsest first).
+        Defaults to ``_RECURSIVE_SEPARATORS``.
+
+    Returns
+    -------
+    list[str]
+        Chunks that each fit within *chunk_size*.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+
+    if separators is None:
+        separators = list(_RECURSIVE_SEPARATORS)
+
+    text = text.strip()
+    if not text:
+        return []
+
+    # Base case: text already fits
+    if len(text) <= chunk_size:
+        return [text]
+
+    # Base case: no separators left — hard split at word/char boundary
+    if not separators:
+        return chunk_text(text, chunk_size, overlap)
+
+    sep = separators[0]
+    remaining_seps = separators[1:]
+
+    # Split on current separator
+    if sep:
+        parts = text.split(sep)
+    else:
+        # Empty separator = character-level (last resort)
+        return chunk_text(text, chunk_size, overlap)
+
+    # Merge small splits back together up to chunk_size
+    chunks: List[str] = []
+    current = ""
+    for part in parts:
+        candidate = (current + sep + part) if current else part
+        if len(candidate) <= chunk_size:
+            current = candidate
+        else:
+            # Flush current buffer
+            if current:
+                chunks.append(current)
+            # This part alone may exceed chunk_size → recurse with finer sep
+            if len(part) > chunk_size:
+                sub_chunks = recursive_chunk_text(
+                    part, chunk_size, overlap, remaining_seps, _depth + 1,
+                )
+                chunks.extend(sub_chunks)
+                current = ""
+            else:
+                current = part
+
+    if current:
+        chunks.append(current)
+
+    # Apply overlap between adjacent chunks at this recursion level
+    if overlap > 0 and len(chunks) > 1:
+        overlapped: List[str] = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev = chunks[i - 1]
+            # Take the tail of the previous chunk as overlap prefix
+            tail = prev[-overlap:] if len(prev) > overlap else prev
+            merged = tail + sep + chunks[i]
+            if len(merged) <= chunk_size:
+                overlapped.append(merged)
+            else:
+                overlapped.append(chunks[i])
+        chunks = overlapped
+
+    return [c for c in chunks if c.strip()]
+
+
 def chunk_by_sections(
     text: str,
     chunk_size: int = 1000,

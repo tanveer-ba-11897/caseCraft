@@ -14,8 +14,21 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATES_DIR = os.path.join(PROJECT_ROOT, "prompts", "templates")
 
 # Initialize Jinja2 Environment
+# auto_reload=False skips filesystem stat checks on every render —
+# templates don't change during a run so this is pure overhead.
 try:
-    env = Environment(loader=FileSystemLoader(TEMPLATES_DIR))
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES_DIR),
+        auto_reload=False,
+        keep_trailing_newline=True,
+    )
+    # Pre-compile all templates at module load so the first render
+    # doesn't pay the parse cost during time-sensitive generation.
+    for _tpl_name in ("generation.j2", "condensation.j2", "reviewer.j2", "checklist_cross_reference.j2"):
+        try:
+            env.get_template(_tpl_name)
+        except Exception:
+            pass
 except Exception as e:
     logger.error("Error loading templates from %s: %s", TEMPLATES_DIR, e)
     env = None
@@ -105,14 +118,36 @@ def _fence_injections(text: str) -> str:
 
 
 def render_template(template_name: str, **kwargs) -> str:
-    """Helper to render a template safely."""
+    """Helper to render a template safely, with optional prompt caching."""
     if not env:
         raise RuntimeError(f"Template environment not initialized. Checked {TEMPLATES_DIR}")
+
+    # Check prompt cache first
+    try:
+        from core.config import config as _cfg
+        if _cfg.cache.enable_prompt_cache:
+            from core.cache import get_prompt_cache
+            cache = get_prompt_cache()
+            cached = cache.get(template_name, **kwargs)
+            if cached is not None:
+                return cached
+    except Exception:
+        pass
+
     try:
         template = env.get_template(template_name)
-        return template.render(**kwargs)
+        rendered = template.render(**kwargs)
     except Exception as e:
         raise RuntimeError(f"Failed to render template {template_name}: {e}")
+
+    # Store in prompt cache
+    try:
+        if _cfg.cache.enable_prompt_cache:  # type: ignore[possibly-undefined]
+            cache.put(template_name, rendered, **kwargs)  # type: ignore[possibly-undefined]
+    except Exception:
+        pass
+
+    return rendered
 
 
 def _sanitize_input(text: str, max_length: int = 500000) -> str:

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from sentence_transformers import SentenceTransformer
 
@@ -17,7 +17,7 @@ class Embedder:
     Handles embedding generation for knowledge chunks.
     """
 
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, model: SentenceTransformer = None):
+    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, model: Optional[SentenceTransformer] = None):
         try:
             self.model = model if model is not None else SentenceTransformer(model_name)
         except Exception as exc:

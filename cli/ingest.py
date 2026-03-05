@@ -42,6 +42,7 @@ def _validate_db_path(db_path: str) -> str:
 def ingest_to_index(documents, db_path: str = "knowledge_base/chroma_db"):
     """
     Chunk, embed, and save documents to the ChromaDB vector store.
+    Parent–child chunking is controlled via casecraft.yaml.
     """
     _validate_db_path(db_path)
 
@@ -53,6 +54,8 @@ def ingest_to_index(documents, db_path: str = "knowledge_base/chroma_db"):
     kb_chunk_size = cfg.knowledge.kb_chunk_size
     print(f"[INFO] Using knowledge base chunk size: {kb_chunk_size} chars")
     print(f"[INFO] Vector store: {db_path}")
+    if cfg.knowledge.parent_child_chunking:
+        print(f"[INFO] Parent–child chunking enabled (child={cfg.knowledge.child_chunk_size}, overlap={cfg.knowledge.child_overlap})")
 
     def _print_progress(stage: str, msg: str) -> None:
         print(f"[INFO] {msg}")
@@ -65,6 +68,8 @@ def ingest_to_index(documents, db_path: str = "knowledge_base/chroma_db"):
     )
 
     print(f"[SUCCESS] Stored {result.total_index_size} total chunks in {db_path}")
+    if result.parent_chunks:
+        print(f"[INFO] Parents: {result.parent_chunks} | Children: {result.child_chunks}")
 
 
 def cmd_ingest_sitemap(args):

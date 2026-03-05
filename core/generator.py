@@ -2,8 +2,8 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -68,14 +68,18 @@ def get_embedder():
 def _compute_kb_budget() -> int:
     """
     Compute the character budget available for knowledge base context
-    in a single LLM prompt, based on context window and output token settings.
+    in a single LLM prompt.
 
-    Uses the dynamically resolved context window (auto-detected from model
-    and capped at max_context_window from YAML).
+    Uses the effective context window (native × context_window_ratio)
+    and a static output token estimate (25% of effective ctx) since
+    the actual prompt is not yet constructed.  At request time, the
+    real output budget is computed dynamically from the prompt size.
 
     Rough formula:
-        available_input_tokens = context_window_size - max_output_tokens
-        available_input_chars  = available_input_tokens * 4  (approx 4 chars/token)
+        effective_ctx          = native_window × context_window_ratio
+        estimated_output       = effective_ctx × 0.25   (static fallback)
+        available_input_tokens = effective_ctx - estimated_output
+        available_input_chars  = available_input_tokens × 4  (~4 chars/token)
         kb_budget              = available_input_chars - PROMPT_OVERHEAD
 
     PROMPT_OVERHEAD accounts for the generation template (~5K chars),
@@ -87,8 +91,8 @@ def _compute_kb_budget() -> int:
     # Use dynamic context window resolution
     ctx = llm_client.get_effective_context_window(config.general.model)
 
-    # Use dynamic output token resolution
-    max_out = llm_client.get_effective_max_output_tokens(config.general.model)
+    # Static output estimate (prompt_chars=0 triggers 25% fallback)
+    max_out = llm_client.get_effective_max_output_tokens(config.general.model, prompt_chars=0)
     available_tokens = max(ctx - max_out, 1024)  # floor at 1024
     available_chars = available_tokens * 4
 
@@ -226,7 +230,22 @@ def _build_prompt(
 def _condense_chunk(chunk: str, model: str) -> str:
     """
     Reduce a document chunk to concise, test relevant bullet points.
+    Uses the condensation cache to skip redundant LLM calls for
+    identical or overlapping chunk text.
     """
+    # Check condensation cache first
+    try:
+        from core.config import config as _cfg
+        if _cfg.cache.enable_condensation_cache:
+            from core.cache import get_condensation_cache
+            cache = get_condensation_cache()
+            cached = cache.get(chunk)
+            if cached is not None:
+                logger.info("Condensation cache HIT (%d chars cached)", len(cached))
+                return cached
+    except Exception:
+        pass
+
     logger.info("Condensing chunk (%d chars)... sending to LLM", len(chunk))
     prompt = build_condensation_prompt(chunk)
 
@@ -240,7 +259,16 @@ def _condense_chunk(chunk: str, model: str) -> str:
     if not condensed:
         raise GenerationError("Empty condensed chunk returned")
 
-    return condensed.strip()
+    result = condensed.strip()
+
+    # Store in condensation cache
+    try:
+        if _cfg.cache.enable_condensation_cache:  # type: ignore[possibly-undefined]
+            cache.put(chunk, result)  # type: ignore[possibly-undefined]
+    except Exception:
+        pass
+
+    return result
 
 def _normalize_test_cases(result) -> list[dict]:
     """
@@ -484,9 +512,12 @@ def _process_single_chunk(
             logger.warning("Generation failed for chunk %d, batch %d: %s", index + 1, batch_idx + 1, exc)
 
     if not all_cases:
-        raise GenerationError(
-            f"Failed to generate test cases for chunk {index} across all KB batches"
+        logger.warning(
+            "Chunk %d: all KB batch(es) produced 0 test cases. "
+            "Skipping chunk — generation continues with remaining chunks.",
+            index + 1,
         )
+        return []
 
     # --- Min-cases-per-chunk re-generation ---
     from core.config import config
@@ -545,9 +576,15 @@ def _generate_from_chunks(
     all_test_cases: List[dict] = []
 
     if len(chunks) == 1:
-        return _process_single_chunk(
-            0, chunks[0], model, max_retries, per_chunk_kb_batches[0], app_type
-        )
+        try:
+            return _process_single_chunk(
+                0, chunks[0], model, max_retries, per_chunk_kb_batches[0], app_type
+            )
+        except Exception as exc:
+            logger.warning(
+                "Chunk 1/1 failed (%s). Returning empty result.", exc,
+            )
+            return []
 
     # Use ThreadPoolExecutor for parallel I/O-bound LLM calls
     with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as executor:
@@ -562,21 +599,120 @@ def _generate_from_chunks(
 
         # Collect results in original chunk order with progress bar
         results_by_index = {}
+        skipped = 0
         pbar = tqdm(
             as_completed(future_to_index),
             total=len(chunks),
             desc="Generating test cases",
             unit="chunk"
         )
+        # Per-chunk timeout: use configured LLM timeout + 60s buffer per chunk
+        from core.config import config as _timeout_cfg
+        chunk_timeout = _timeout_cfg.general.timeout + 60
+
         for future in pbar:
             index = future_to_index[future]
-            results_by_index[index] = future.result()  # Re-raises exceptions
+            try:
+                results_by_index[index] = future.result(timeout=chunk_timeout)
+            except FutureTimeoutError:
+                logger.warning(
+                    "Chunk %d/%d timed out after %ds. Skipping — generation continues.",
+                    index + 1, len(chunks), chunk_timeout,
+                )
+                results_by_index[index] = []
+                skipped += 1
+            except Exception as exc:
+                logger.warning(
+                    "Chunk %d/%d failed (%s). Skipping — generation continues.",
+                    index + 1, len(chunks), exc,
+                )
+                results_by_index[index] = []
+                skipped += 1
         pbar.close()
+
+        if skipped:
+            logger.info(
+                "%d/%d chunk(s) skipped due to errors.", skipped, len(chunks),
+            )
+
+        # --- Retry skipped chunks sequentially (one at a time) ---
+        failed_indices = [
+            i for i in sorted(results_by_index.keys())
+            if not results_by_index[i]
+            and chunks[i].strip()  # skip genuinely empty chunks
+        ]
+        if failed_indices:
+            logger.info(
+                "Retrying %d skipped chunk(s) sequentially...",
+                len(failed_indices),
+            )
+            recovered = 0
+            for idx in failed_indices:
+                logger.info(
+                    "Retry: chunk %d/%d", idx + 1, len(chunks),
+                )
+                try:
+                    result = _process_single_chunk(
+                        idx, chunks[idx], model, max_retries,
+                        per_chunk_kb_batches[idx], app_type,
+                    )
+                    if result:
+                        results_by_index[idx] = result
+                        recovered += 1
+                        logger.info(
+                            "Retry succeeded for chunk %d (%d case(s))",
+                            idx + 1, len(result),
+                        )
+                    else:
+                        logger.warning(
+                            "Retry for chunk %d produced 0 cases. Giving up on this chunk.",
+                            idx + 1,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Retry for chunk %d failed again (%s). Giving up on this chunk.",
+                        idx + 1, exc,
+                    )
+            if recovered:
+                logger.info(
+                    "Retry pass recovered %d/%d chunk(s).",
+                    recovered, len(failed_indices),
+                )
 
         for i in sorted(results_by_index.keys()):
             all_test_cases.extend(results_by_index[i])
 
     return all_test_cases
+
+
+def _coerce_str_list(items: Any) -> list[str]:
+    """
+    Coerce a value into a flat ``List[str]``.
+
+    Handles common LLM output shapes that violate the schema:
+      - plain string → single-element list
+      - list of dicts (e.g. [{"step": "…"}]) → stringify each dict's values
+      - list of mixed types → str() each
+      - non-list → empty list
+    """
+    if isinstance(items, str):
+        return [items] if items.strip() else []
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Flatten dict values into a single string.
+            # e.g. {"step": 1, "action": "Click login"} → "1 - Click login"
+            parts = [str(v) for v in item.values() if v is not None]
+            if parts:
+                result.append(" - ".join(parts))
+        elif isinstance(item, (int, float)):
+            result.append(str(item))
+        # Skip other types silently
+    return result
 
 
 def _sanitize_test_cases(test_cases: list[dict]) -> list[dict]:
@@ -589,15 +725,7 @@ def _sanitize_test_cases(test_cases: list[dict]) -> list[dict]:
         case = dict(case)  # shallow copy
 
         # expected_results must be List[str]
-        exp = case.get("expected_results", [])
-        if isinstance(exp, str):
-            case["expected_results"] = []
-        elif isinstance(exp, list):
-            case["expected_results"] = [
-                str(item) for item in exp if isinstance(item, (str, int, float))
-            ]
-        else:
-            case["expected_results"] = []
+        case["expected_results"] = _coerce_str_list(case.get("expected_results", []))
 
         # Ensure required string fields have defaults
         if not case.get("use_case"):
@@ -610,37 +738,32 @@ def _sanitize_test_cases(test_cases: list[dict]) -> list[dict]:
             case["priority"] = "medium"
 
         # actual_results must be List[str]
-        act = case.get("actual_results", [])
-        if isinstance(act, list):
-            normalized = []
-            for item in act:
-                if isinstance(item, str):
-                    normalized.append(item)
-                else:
-                    normalized.append(str(item))
-            case["actual_results"] = normalized
-        else:
-            case["actual_results"] = []
+        case["actual_results"] = _coerce_str_list(case.get("actual_results", []))
 
-        # preconditions
-        if not isinstance(case.get("preconditions"), list):
-            case["preconditions"] = []
+        # preconditions must be List[str]
+        case["preconditions"] = _coerce_str_list(case.get("preconditions", []))
 
-        # steps
-        if not isinstance(case.get("steps"), list):
-            case["steps"] = []
+        # steps must be List[str]
+        case["steps"] = _coerce_str_list(case.get("steps", []))
 
-        if not isinstance(case.get("tags"), list):
-            case["tags"] = []
+        # tags must be List[str]
+        case["tags"] = _coerce_str_list(case.get("tags", []))
 
-        # dependencies
-        if not isinstance(case.get("dependencies"), list):
-            case["dependencies"] = []
+        # dependencies must be List[str]
+        case["dependencies"] = _coerce_str_list(case.get("dependencies", []))
 
         # test_data must be Dict[str, str]
         td = case.get("test_data", {})
         if isinstance(td, dict):
             case["test_data"] = {k: str(v) for k, v in td.items()}
+        elif isinstance(td, list):
+            # Sometimes LLMs return test_data as a list of dicts
+            merged = {}
+            for item in td:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        merged[k] = str(v)
+            case["test_data"] = merged
         else:
             case["test_data"] = {}
 
@@ -850,7 +973,7 @@ def generate_test_suite(
 
     Args:
         progress: Optional callback ``(stage, message)`` invoked at each
-                  major pipeline stage so callers (e.g. VS Code extension)
+                  major pipeline stage so callers (e.g. MCP server)
                   can surface real-time progress to the user.
     """
     from core.config import config
@@ -866,13 +989,15 @@ def generate_test_suite(
     
     # Resolve effective context window (auto-detect + cap)
     effective_ctx = llm_client.get_effective_context_window(model)
-    effective_max_out = llm_client.get_effective_max_output_tokens(model)
+    # Static estimate (actual output tokens are computed dynamically per-call)
+    effective_max_out = llm_client.get_effective_max_output_tokens(model, prompt_chars=0)
     
-    logger.info("Config: chunk_size=%d, chunk_overlap=%d, model=%s, context_window=%d (max_cap=%d), "
-          "max_output_tokens=%d, top_k=%s, min_cases_per_chunk=%d",
+    logger.info("Config: chunk_size=%d, chunk_overlap=%d, model=%s, context_window=%d (%.0f%% of native), "
+          "min_output_tokens=%d, dynamic_output_est=%d, top_k=%s, min_cases_per_chunk=%d",
           config.generation.chunk_size, config.generation.chunk_overlap,
-          model, effective_ctx, config.general.max_context_window,
-          effective_max_out, config.quality.top_k, config.generation.min_cases_per_chunk)
+          model, effective_ctx, config.general.context_window_ratio * 100,
+          config.general.min_output_tokens, effective_max_out,
+          config.quality.top_k, config.generation.min_cases_per_chunk)
     chunks = parse_document(
         file_path,
         chunk_size=config.generation.chunk_size,
@@ -909,10 +1034,11 @@ def generate_test_suite(
 
     # Determine final parameters (Arg > Config)
     final_app_type = app_type if app_type else config.generation.app_type
+    max_workers = config.generation.max_workers
 
     # Generate test cases (parallel across feature chunks, sequential KB condensation + generation)
-    logger.info("Starting enhanced RAG pipeline: %d chunk(s), %d KB batch(es) to condense + generate using model '%s'...",
-          len(chunks), total_kb_batches, model)
+    logger.info("Starting enhanced RAG pipeline: %d chunk(s), %d KB batch(es) to condense + generate using model '%s' (max_workers=%d)...",
+          len(chunks), total_kb_batches, model, max_workers)
     _progress("generating", f"Generating test cases from {len(chunks)} chunk(s) using {model}…")
     raw_test_cases = _generate_from_chunks(
         chunks=chunks,
@@ -920,8 +1046,19 @@ def generate_test_suite(
         max_retries=max_retries,
         per_chunk_kb_batches=per_chunk_kb,
         app_type=final_app_type,
+        max_workers=max_workers,
     )
     logger.info("Raw generation complete: %d test cases from all chunks", len(raw_test_cases))
+
+    if not raw_test_cases:
+        logger.warning("No test cases generated from any chunk. Returning empty suite.")
+        _progress("complete", "No test cases could be generated from any chunk")
+        return TestSuite(
+            feature_name="Generated Feature",
+            source_document=file_path,
+            test_cases=[],
+        )
+
     _progress("post_processing", f"Post-processing {len(raw_test_cases)} raw test cases…")
 
 
@@ -1008,6 +1145,14 @@ def generate_test_suite(
             final_suite = _review_test_suite(final_suite, model)
 
         _progress("complete", f"Done — {len(final_suite.test_cases)} test cases ready")
+
+        # Log cache performance statistics
+        try:
+            from core.cache import log_cache_stats
+            log_cache_stats()
+        except Exception:
+            pass
+
         return final_suite
     except Exception as exc:
         raise GenerationError(

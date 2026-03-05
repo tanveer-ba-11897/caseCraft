@@ -1,9 +1,11 @@
 
 import logging
+import os
 import random
 import requests
+import threading
 import time
-from typing import Callable, Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from core.config import config
 
 logger = logging.getLogger("casecraft.llm")
@@ -11,24 +13,82 @@ logger = logging.getLogger("casecraft.llm")
 # HTTP status codes that should trigger a retry
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
-# ── VS Code LLM Proxy ────────────────────────────────────────────────────────
-# When llm_provider is "vscode", LLM calls are proxied through the bridge
-# server to the VS Code Language Model API (Copilot models).  The callback
-# is set by bridge_server.py at startup.
-_vscode_llm_callback: Optional[Callable[..., str]] = None
+# ── Per-model specifications ────────────────────────────────────────────────
+# Hard ceilings imposed by the provider.  Each entry contains:
+#   - context_window : model's maximum context window (tokens)
+#   - max_output     : model's maximum output / completion tokens
+# Unknown models fall back to detect_native_context_window() for context
+# and have no output cap.
+MODEL_SPECS: Dict[str, Dict[str, int]] = {
+    # OpenAI
+    "gpt-4o":       {"context_window": 128_000, "max_output": 16_384},
+    "gpt-4o-mini":  {"context_window": 128_000, "max_output": 16_384},
+    "o1":           {"context_window": 200_000, "max_output": 100_000},
+    "o1-mini":      {"context_window": 128_000, "max_output": 65_536},
+    "o3-mini":      {"context_window": 200_000, "max_output": 100_000},
+    "o4-mini":      {"context_window": 200_000, "max_output": 100_000},
+    "gpt-5":        {"context_window": 200_000, "max_output": 100_000},
+    "gpt-5-mini":   {"context_window": 200_000, "max_output": 100_000},
+    "gpt-5-nano":   {"context_window": 200_000, "max_output": 32_768},
+    # Meta
+    "Meta-Llama-3.1-405B-Instruct": {"context_window": 128_000, "max_output": 4_096},
+    "Meta-Llama-3.1-70B-Instruct":  {"context_window": 128_000, "max_output": 4_096},
+    "Meta-Llama-3.1-8B-Instruct":   {"context_window": 128_000, "max_output": 4_096},
+    # DeepSeek
+    "DeepSeek-R1":      {"context_window": 128_000, "max_output": 16_384},
+    "DeepSeek-R1-0528": {"context_window": 128_000, "max_output": 16_384},
+    # Microsoft
+    "Phi-4":    {"context_window": 16_384, "max_output": 4_096},
+    "MAI-DS-R1": {"context_window": 128_000, "max_output": 16_384},
+    # Mistral
+    "Mistral-large":      {"context_window": 128_000, "max_output": 4_096},
+    "Mistral-large-2411": {"context_window": 128_000, "max_output": 4_096},
+    "Mistral-small":      {"context_window": 32_000,  "max_output": 4_096},
+    # Cohere
+    "Cohere-command-r-plus": {"context_window": 128_000, "max_output": 4_096},
+    "Cohere-command-r":      {"context_window": 128_000, "max_output": 4_096},
+    # xAI
+    "xai-grok-3":      {"context_window": 131_072, "max_output": 16_384},
+    "xai-grok-3-mini": {"context_window": 131_072, "max_output": 16_384},
+}
 
+# Approximate characters per token (used to estimate input tokens from prompt length)
+CHARS_PER_TOKEN = 4
 
-def set_vscode_llm_callback(callback: Callable[..., str]) -> None:
-    """Register the VS Code LLM proxy function (called by bridge_server.py)."""
-    global _vscode_llm_callback
-    _vscode_llm_callback = callback
-    logger.info("VS Code LLM proxy callback registered")
+# ── GitHub Models (Copilot) ────────────────────────────────────────────────
+# When llm_provider is "copilot", requests go through GitHub's Models API.
+# Supports both the legacy and current endpoints:
+#   - Legacy:  https://models.inference.ai.azure.com
+#   - Current: https://models.github.ai/inference
+# Requires a GitHub PAT with 'models:read' scope.
+# Env var: GITHUB_TOKEN or CASECRAFT_GENERAL_API_KEY
+GITHUB_MODELS_BASE_URL = "https://models.github.ai/inference"
+GITHUB_MODELS_SUPPORTED = {
+    # OpenAI
+    "gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini", "o4-mini",
+    "gpt-5", "gpt-5-mini", "gpt-5-nano",
+    # Meta
+    "Meta-Llama-3.1-405B-Instruct", "Meta-Llama-3.1-70B-Instruct",
+    "Meta-Llama-3.1-8B-Instruct",
+    # Mistral
+    "Mistral-large", "Mistral-large-2411", "Mistral-small",
+    # Cohere
+    "Cohere-command-r-plus", "Cohere-command-r",
+    # DeepSeek
+    "DeepSeek-R1", "DeepSeek-R1-0528",
+    # Microsoft
+    "Phi-4", "MAI-DS-R1",
+    # xAI
+    "xai-grok-3", "xai-grok-3-mini",
+}
+
 
 class LLMClient:
     """
     Abstract client for interacting with LLM backends.
     Supports 'ollama' (native) and 'openai' (compatible) formats.
-    Features exponential backoff with jitter for transient failures.
+    Features exponential backoff with jitter for transient failures
+    and configurable inter-call throttling for rate-limited providers.
     """
     
     def __init__(self):
@@ -42,6 +102,14 @@ class LLMClient:
         self.max_retries = 3
         self.base_delay = 1.0  # seconds
         self.max_delay = 60.0  # seconds
+
+        # ── Inter-call throttle ────────────────────────────────────────
+        # Enforces a minimum gap between consecutive LLM API calls.
+        # Prevents rate-limit (429) errors on providers with strict RPM
+        # caps such as GitHub Models free tier (10-15 RPM).
+        self._call_delay = config.general.llm_call_delay
+        self._last_call_time: float = 0.0
+        self._throttle_lock = threading.Lock()
 
         # Warn if using unencrypted HTTP for non-localhost addresses
         if self.base_url.startswith("http://") and not any(
@@ -105,7 +173,17 @@ class LLMClient:
             except requests.RequestException as e:
                 last_error = e
                 should_retry, retry_after = self._is_retryable_error(e)
-                
+
+                # Log response body for non-retryable errors (e.g. 400)
+                # to help diagnose payload issues.
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        body = e.response.text[:500]
+                        logger.error("Response body from %s (HTTP %d): %s",
+                                     provider_name, e.response.status_code, body)
+                    except Exception:
+                        pass
+
                 if not should_retry or attempt >= self.max_retries:
                     logger.error("LLM Connection Error (%s): %s", provider_name, e)
                     raise
@@ -132,19 +210,22 @@ class LLMClient:
         # Should not reach here, but just in case
         raise last_error if last_error else RuntimeError("Unexpected retry loop exit")
 
-    def detect_context_window(self, model: str) -> int:
+    def detect_native_context_window(self, model: str) -> int:
         """
-        Auto-detect the model's native context window from the Ollama API.
-        Falls back to config.general.context_window_size if detection fails.
-        Result is capped at config.general.max_context_window.
+        Detect the model's native (maximum) context window.
+
+        - **Ollama**: queries ``/api/show`` for the model's ``context_length``.
+        - **Other providers**: defaults to 131072 (128K), which is safe for
+          most cloud models (GPT-4o, Gemini, DeepSeek, etc.).
+
+        The result is cached for the lifetime of this client instance.
         """
         if self._resolved_context_window is not None:
             return self._resolved_context_window
 
-        detected = config.general.context_window_size
-        max_cap = config.general.max_context_window
+        native: int = 0
 
-        if config.general.auto_detect_context_window and self.provider == "ollama":
+        if self.provider == "ollama":
             try:
                 url = f"{self.base_url}/api/show"
                 response = requests.post(url, json={"name": model}, timeout=15)
@@ -153,77 +234,118 @@ class LLMClient:
 
                 # Ollama returns model info with parameters or model_info
                 model_info = data.get("model_info", {})
-                # Look for context_length in model_info keys
                 for key, value in model_info.items():
                     if "context_length" in key.lower():
-                        detected = int(value)
-                        logger.info("Auto-detected context window for '%s': %d tokens", model, detected)
+                        native = int(value)
+                        logger.info("Auto-detected native context window for '%s': %d tokens", model, native)
                         break
 
-                # Also check parameters string (older Ollama)
-                if detected == config.general.context_window_size:
+                # Also check parameters string (older Ollama versions)
+                if native <= 0:
                     params_str = data.get("parameters", "")
                     if params_str:
                         for line in params_str.split("\n"):
                             if "num_ctx" in line:
                                 try:
-                                    detected = int(line.split()[-1])
-                                    logger.info("Auto-detected context window from parameters: %d tokens", detected)
+                                    native = int(line.split()[-1])
+                                    logger.info("Auto-detected context window from parameters: %d tokens", native)
                                 except (ValueError, IndexError):
                                     pass
                                 break
 
             except Exception as e:
-                logger.warning("Context window auto-detection failed: %s. Using configured value.", e)
+                logger.warning("Context window auto-detection failed: %s. Using default.", e)
 
-        # If still -1 (no explicit config, no detection), use conservative default
-        if detected <= 0:
-            detected = 8192
-            logger.info("No context window detected, using default: %d tokens", detected)
+        # Fallback: use MODEL_SPECS if available, else 128K / 8192
+        if native <= 0:
+            spec = MODEL_SPECS.get(model)
+            if spec:
+                native = spec["context_window"]
+                logger.info("Using MODEL_SPECS context window for '%s': %d tokens", model, native)
+            else:
+                native = 131_072 if self.provider != "ollama" else 8192
+                logger.info("Using default native context window: %d tokens", native)
 
-        # Apply the max cap from YAML
-        if max_cap > 0 and detected > max_cap:
-            logger.info("Capping context window: %d → %d tokens (max_context_window)", detected, max_cap)
-            detected = max_cap
-
-        self._resolved_context_window = detected
-        return detected
+        self._resolved_context_window = native
+        return native
 
     def get_effective_context_window(self, model: str) -> int:
         """
-        Return the effective context window to use for this model.
-        Uses explicit config if set, otherwise auto-detects and caps.
-        """
-        explicit = config.general.context_window_size
-        if explicit > 0 and not config.general.auto_detect_context_window:
-            # User explicitly set a value and disabled auto-detect
-            return explicit
-        return self.detect_context_window(model)
+        Return the effective context window after applying ``context_window_ratio``.
 
-    def get_effective_max_output_tokens(self, model: str) -> int:
-        """
-        Return the effective max output tokens for this model.
-        When max_output_tokens is -1, auto-scales to output_token_ratio of
-        the effective context window, capped at max_output_tokens_cap.
-        """
-        explicit = config.general.max_output_tokens
-        if explicit > 0:
-            return explicit
+        effective = native_window × context_window_ratio
 
-        # Auto-scale: use a fraction of the effective context window
+        The result is floored at 2048 tokens to ensure a usable minimum.
+        """
+        native = self.detect_native_context_window(model)
+        ratio = max(0.01, min(config.general.context_window_ratio, 1.0))
+        effective = max(int(native * ratio), 2048)
+        logger.info("Effective context window: %d tokens (%.0f%% of %d native)",
+                     effective, ratio * 100, native)
+        return effective
+
+    def get_effective_max_output_tokens(self, model: str, prompt_chars: int = 0) -> int:
+        """
+        Return the max output tokens for a given request, **dynamically** sized
+        based on how large the prompt actually is.
+
+        When *prompt_chars* > 0 (dynamic mode):
+            estimated_input = prompt_chars / CHARS_PER_TOKEN
+            output_budget   = effective_ctx - estimated_input
+        When *prompt_chars* == 0 (static fallback — used by ``_compute_kb_budget``):
+            output_budget   = effective_ctx × 0.25  (conservative estimate)
+
+        The result is:
+            - floored at ``min_output_tokens`` (config, default 1024)
+            - capped at the model's provider-imposed maximum from ``MODEL_SPECS``
+        """
         ctx = self.get_effective_context_window(model)
-        ratio = max(0.05, min(config.general.output_token_ratio, 0.5))
-        scaled = int(ctx * ratio)
+        min_out = max(config.general.min_output_tokens, 256)
 
-        # Apply floor and cap
-        scaled = max(scaled, 1024)  # never below 1024
-        cap = config.general.max_output_tokens_cap
-        if cap > 0 and scaled > cap:
-            scaled = cap
+        if prompt_chars > 0:
+            # Dynamic: allocate remaining budget to output after input
+            estimated_input_tokens = prompt_chars // CHARS_PER_TOKEN
+            budget = ctx - estimated_input_tokens
+            logger.info("Dynamic token allocation: %d ctx - %d est. input = %d raw output budget",
+                        ctx, estimated_input_tokens, budget)
+        else:
+            # Static fallback (25% of effective ctx)
+            budget = int(ctx * 0.25)
 
-        logger.info("Auto-scaled max_output_tokens: %d (%.0f%% of %d ctx, cap=%d)",
-              scaled, ratio * 100, ctx, cap)
-        return scaled
+        # Floor at min_output_tokens
+        budget = max(budget, min_out)
+
+        # Cap at model-specific ceiling if known
+        spec = MODEL_SPECS.get(model)
+        if spec and budget > spec["max_output"]:
+            logger.info("Clamping output tokens from %d to %d (model cap for '%s')",
+                        budget, spec["max_output"], model)
+            budget = spec["max_output"]
+
+        logger.info("Effective max_output_tokens: %d (ctx=%d, prompt_chars=%d, min=%d)",
+                     budget, ctx, prompt_chars, min_out)
+        return budget
+
+    def _throttle(self) -> None:
+        """
+        Enforce the minimum inter-call delay (``llm_call_delay``).
+
+        Thread-safe: concurrent worker threads will queue up behind the
+        lock so that no two calls are closer together than the configured
+        delay.  The wait happens *before* the HTTP request, not after,
+        so the very first call of a session is never delayed.
+        """
+        if self._call_delay <= 0:
+            return
+
+        with self._throttle_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call_time
+            remaining = self._call_delay - elapsed
+            if remaining > 0:
+                logger.debug("Throttling: waiting %.1fs before next LLM call", remaining)
+                time.sleep(remaining)
+            self._last_call_time = time.monotonic()
 
     def generate(self, prompt: str, model: str, json_mode: bool = False) -> str:
         """
@@ -232,6 +354,10 @@ class LLMClient:
         prompt_len = len(prompt)
         logger.info("Sending request to %s (%d chars, json_mode=%s, timeout=%ds)...",
               self.provider, prompt_len, json_mode, self.timeout)
+
+        # Enforce inter-call delay (thread-safe) before hitting the API
+        self._throttle()
+
         start_time = time.time()
         try:
             if self.provider == "ollama":
@@ -240,8 +366,8 @@ class LLMClient:
                 result = self._generate_openai_compatible(prompt, model, json_mode)
             elif self.provider == "google":
                 result = self._generate_google(prompt, model, json_mode)
-            elif self.provider == "vscode":
-                result = self._generate_vscode(prompt, model, json_mode)
+            elif self.provider == "copilot":
+                result = self._generate_copilot(prompt, model, json_mode)
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.provider}")
             elapsed = time.time() - start_time
@@ -257,7 +383,7 @@ class LLMClient:
         Native Ollama API (/api/generate).
         """
         url = f"{self.base_url}/api/generate"
-        effective_max_out = self.get_effective_max_output_tokens(model)
+        effective_max_out = self.get_effective_max_output_tokens(model, prompt_chars=len(prompt))
         payload = {
             "model": model,
             "prompt": prompt,
@@ -269,8 +395,7 @@ class LLMClient:
             }
         }
 
-        # If user explicitly sets context window (e.g. 8192, 16384), pass it. 
-        # If -1, auto-detect from model and cap at max_context_window.
+        # Set effective context window (auto-detected × context_window_ratio)
         effective_ctx = self.get_effective_context_window(model)
         payload["options"]["num_ctx"] = effective_ctx
         
@@ -286,8 +411,19 @@ class LLMClient:
     def _generate_openai_compatible(self, prompt: str, model: str, json_mode: bool) -> str:
         """
         OpenAI-compatible API (/v1/chat/completions).
-        Works with LM Studio, LocalAI, vLLM, and Ollama v1.
+        Works with LM Studio, LocalAI, vLLM, Ollama v1, and GitHub Models.
         """
+        # Resolve API key: if placeholder, fall back to GITHUB_TOKEN env var
+        api_key = self.api_key
+        if not api_key or api_key in ("ollama", "", "GITHUB_TOKEN"):
+            api_key = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("CASECRAFT_GENERAL_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OpenAI-compatible provider requires an API key. "
+                "Set CASECRAFT_GENERAL_API_KEY or GITHUB_TOKEN env var, "
+                "or api_key in casecraft.yaml."
+            )
+
         # Ensure URL ends with /v1 or /v1/chat/completions correctly
         base = self.base_url.rstrip('/')
         if not base.endswith("/v1"):
@@ -296,12 +432,12 @@ class LLMClient:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
+            "Authorization": f"Bearer {api_key}"
         }
 
         messages = [{"role": "user", "content": prompt}]
         
-        effective_max_out = self.get_effective_max_output_tokens(model)
+        effective_max_out = self.get_effective_max_output_tokens(model, prompt_chars=len(prompt))
         payload = {
             "model": model,
             "messages": messages,
@@ -336,7 +472,7 @@ class LLMClient:
             "x-goog-api-key": self.api_key
         }
 
-        effective_max_out = self.get_effective_max_output_tokens(model)
+        effective_max_out = self.get_effective_max_output_tokens(model, prompt_chars=len(prompt))
         generation_config = {
             "temperature": config.generation.temperature,
             "topP": config.generation.top_p,
@@ -368,21 +504,68 @@ class LLMClient:
                 return parts[0].get("text", "")
         return ""
 
-    def _generate_vscode(self, prompt: str, model: str, json_mode: bool) -> str:
+    def _generate_copilot(self, prompt: str, model: str, json_mode: bool) -> str:
         """
-        Proxy LLM generation through the VS Code Language Model API.
-
-        The bridge_server.py registers a callback via set_vscode_llm_callback()
-        that sends the prompt to TypeScript over stdout and blocks until the
-        response arrives on stdin.
+        GitHub Models API (OpenAI-compatible).
+        Uses the GitHub Models inference endpoint with a GitHub PAT.
+        Docs: https://docs.github.com/en/github-models
         """
-        if _vscode_llm_callback is None:
-            raise RuntimeError(
-                "VS Code LLM proxy not available. "
-                "The 'vscode' provider can only be used when running inside "
-                "the VS Code CaseCraft extension (bridge_server.py)."
+        # Resolve API key: prefer explicit config, then GITHUB_TOKEN env var
+        api_key = self.api_key
+        if not api_key or api_key in ("ollama", "", "GITHUB_TOKEN"):
+            api_key = os.environ.get("GITHUB_TOKEN", "")
+        if not api_key:
+            raise ValueError(
+                "GitHub Models requires a GitHub PAT. Set GITHUB_TOKEN env var "
+                "or api_key in casecraft.yaml (needs 'models:read' scope)."
             )
-        return _vscode_llm_callback(prompt, model, json_mode)
+
+        # Use user-configured base_url if it looks like a GitHub Models endpoint,
+        # otherwise fall back to the default GITHUB_MODELS_BASE_URL.
+        base = self.base_url.rstrip('/')
+        if "models.github.ai" in base or "models.inference.ai.azure.com" in base:
+            # Strip trailing /v1 if present (we build the path ourselves)
+            if base.endswith("/v1"):
+                base = base[:-3]
+            endpoint_base = base
+        else:
+            endpoint_base = GITHUB_MODELS_BASE_URL
+
+        url = f"{endpoint_base}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        effective_max_out = self.get_effective_max_output_tokens(model, prompt_chars=len(prompt))
+        messages = [{"role": "user", "content": prompt}]
+
+        # Reasoning models (o1, o3, o4, etc.) don't accept temperature/top_p
+        is_reasoning = model.startswith(("o1", "o3", "o4"))
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            # GitHub Models API follows latest OpenAI spec:
+            # use 'max_completion_tokens' (not deprecated 'max_tokens').
+            "max_completion_tokens": effective_max_out,
+        }
+
+        if not is_reasoning:
+            payload["temperature"] = config.generation.temperature
+            payload["top_p"] = config.generation.top_p
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        response = self._request_with_retry(
+            "post", url, "GitHub Models (Copilot)",
+            headers=headers, json=payload, timeout=self.timeout, verify=True
+        )
+        data = response.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        return ""
 
     def unload_model(self, model: str) -> bool:
         """

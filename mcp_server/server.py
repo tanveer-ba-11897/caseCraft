@@ -1,10 +1,19 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
 import sys
 import time
+import types
 from pathlib import Path
-from typing import Optional, List, Any
-from mcp.server.fastmcp import FastMCP
+from typing import TYPE_CHECKING, Any, Callable, Optional
+from mcp.server.fastmcp import FastMCP, Context
+
+if TYPE_CHECKING:
+    from core import exporter as _exporter_mod
+    from core.config import CaseCraftConfig
+    from core.knowledge.retriever import KnowledgeRetriever as _RetrieverType
 
 # Configure server-side logging (stderr only — stdout is reserved for MCP protocol)
 logging.basicConfig(
@@ -58,10 +67,10 @@ def _validate_file_path(file_path: str) -> str:
 # ─── Lazy Import Cache ──────────────────────────────────────────────────────
 # Heavy modules (sentence-transformers, torch, etc.) are NOT imported at startup.
 # They are loaded on first tool call so the MCP handshake completes instantly.
-_generator = None
-_config = None
-_retriever_cls = None
-_exporter = None
+_generator: Optional[Callable[..., Any]] = None
+_config: Optional[CaseCraftConfig] = None
+_retriever_cls: Optional[type[_RetrieverType]] = None
+_exporter: Optional[types.ModuleType] = None
 
 def _load_core():
     """Lazily import the heavy CaseCraft modules."""
@@ -83,6 +92,31 @@ def _load_core():
 _last_generate_call = 0.0
 RATE_LIMIT_SECONDS = 5
 
+# ─── Keep-Alive Helper ──────────────────────────────────────────────────────
+KEEPALIVE_INTERVAL = 60  # seconds between progress pings
+
+async def _run_with_keepalive(ctx: Context, blocking_fn, *args, **kwargs):
+    """
+    Run a blocking function in a thread while sending periodic progress
+    updates via the MCP Context so the client doesn't time out.
+    """
+    loop = asyncio.get_running_loop()
+    task = loop.run_in_executor(None, lambda: blocking_fn(*args, **kwargs))
+    
+    step = 0
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=KEEPALIVE_INTERVAL)
+            # Task finished — send final progress and return
+            await ctx.report_progress(100, 100)
+            return result
+        except asyncio.TimeoutError:
+            # Task still running — send keep-alive ping
+            step += 1
+            await ctx.report_progress(step, step + 5,
+                                      f"Processing… ({step * KEEPALIVE_INTERVAL}s elapsed)")
+            await ctx.info(f"Still working… ({step * KEEPALIVE_INTERVAL}s elapsed)")
+
 
 # 1. Initialize MCP Server (lightweight — no heavy deps)
 mcp = FastMCP("CaseCraft")
@@ -92,7 +126,7 @@ logger.info("CaseCraft MCP server initialized. Waiting for client connection..."
 # 2. Define Tools
 
 @mcp.tool()
-def generate_tests(file_path: str, app_type: str = None) -> str:
+async def generate_tests(file_path: str, app_type: Optional[str] = None, ctx: Optional[Context] = None) -> str:
     """
     Generate a comprehensive test suite from a requirement document.
     
@@ -120,15 +154,33 @@ def generate_tests(file_path: str, app_type: str = None) -> str:
         logger.warning(f"Path validation failed for '{file_path}': {e}")
         return f"Error: Invalid or inaccessible file path."
 
-    # Lazy load heavy modules
-    _load_core()
+    # Lazy load heavy modules (with keep-alive pings)
+    if ctx:
+        await ctx.info("Loading CaseCraft core modules…")
+        await _run_with_keepalive(ctx, _load_core)
+    else:
+        _load_core()
+    assert _generator is not None and _config is not None and _exporter is not None
+
+    # Capture narrowed references for closures (Pyright can't narrow globals inside closures)
+    generator = _generator
+    cfg = _config
+    exporter = _exporter
 
     try:
-        suite = _generator(
-            file_path=validated_path,
-            dedup_semantic=True,
-            app_type=app_type or _config.generation.app_type
-        )
+        # Run the heavy generation in a thread with keep-alive
+        def _do_generate():
+            return generator(
+                file_path=validated_path,
+                dedup_semantic=True,
+                app_type=app_type or cfg.generation.app_type
+            )
+
+        if ctx:
+            await ctx.info("Generating test cases — this may take several minutes…")
+            suite = await _run_with_keepalive(ctx, _do_generate)
+        else:
+            suite = _do_generate()
         
         # Save to file (Fix for missing output / context overflow)
         # Default to outputs/ directory with timestamp to avoid collisions
@@ -141,15 +193,18 @@ def generate_tests(file_path: str, app_type: str = None) -> str:
         excel_path = output_dir / f"{base_name}_{timestamp}.xlsx"
         
         # Export
-        _exporter.export(suite, "json", str(json_path))
-        _exporter.export(suite, "excel", str(excel_path))
+        exporter.export(suite, "json", str(json_path))
+        exporter.export(suite, "excel", str(excel_path))
         
         # Unload model from Ollama memory to free resources
         try:
             from core.llm_client import llm_client
-            llm_client.unload_model(_config.general.model)
+            llm_client.unload_model(cfg.general.model)
         except Exception:
             pass
+        
+        if ctx:
+            await ctx.info(f"Done — {len(suite.test_cases)} test cases generated.")
         
         return (
             f"Successfully generated {len(suite.test_cases)} test cases.\n"
@@ -164,7 +219,7 @@ def generate_tests(file_path: str, app_type: str = None) -> str:
         return "Error: Test generation failed. Check server logs for details."
 
 @mcp.tool()
-def query_knowledge(query: str, top_k: int = 3) -> str:
+async def query_knowledge(query: str, top_k: int = 3, ctx: Optional[Context] = None) -> str:
     """
     Search the CaseCraft knowledge base for relevant snippets.
     Useful for answering questions about product requirements.
@@ -176,9 +231,26 @@ def query_knowledge(query: str, top_k: int = 3) -> str:
     query = query[:10000]
 
     try:
-        _load_core()
-        retriever = _retriever_cls()
-        chunks = retriever.retrieve(query, top_k=top_k)
+        # Lazy load with keep-alive
+        if ctx:
+            await ctx.info("Loading knowledge base…")
+            await _run_with_keepalive(ctx, _load_core)
+        else:
+            _load_core()
+        assert _retriever_cls is not None
+
+        # Capture narrowed reference for closure
+        retriever_cls = _retriever_cls
+
+        def _do_query():
+            retriever = retriever_cls()
+            return retriever.retrieve(query, top_k=top_k)
+
+        if ctx:
+            await ctx.info("Searching knowledge base…")
+            chunks = await _run_with_keepalive(ctx, _do_query)
+        else:
+            chunks = _do_query()
         
         if not chunks:
             return "No relevant information found."

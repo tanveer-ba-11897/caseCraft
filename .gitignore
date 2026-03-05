@@ -231,11 +231,6 @@ casecraft_config.json
 
 # Local Debug Scripts
 debug_*.py
-
-# VS Code Extension build artifacts
-vscode-casecraft/node_modules/
-vscode-casecraft/out/
-vscode-casecraft/*.vsix
 test_*.py
 
 # MCP & AnythingLLM configurations

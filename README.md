@@ -1,6 +1,6 @@
 # CaseCraft
 
-CaseCraft is an Agentic QA Engine that transforms feature requirement documents into structured, production-ready test suites. It uses local or cloud-based LLMs, Retrieval-Augmented Generation (RAG), and multiple integration interfaces — CLI, MCP Server, and a **VS Code Chat Participant extension** — to generate comprehensive test cases grounded in your product's existing documentation. The VS Code extension lets you invoke CaseCraft directly from GitHub Copilot Chat using models like GPT-4o, Claude Sonnet, and Gemini, with no local LLM or API key required.
+CaseCraft is an Agentic QA Engine that transforms feature requirement documents into structured, production-ready test suites. It uses local or cloud-based LLMs, Retrieval-Augmented Generation (RAG), and multiple integration interfaces — CLI and MCP Server — to generate comprehensive test cases grounded in your product's existing documentation.
 
 ---
 
@@ -9,24 +9,25 @@ CaseCraft is an Agentic QA Engine that transforms feature requirement documents 
 ```mermaid
 sequenceDiagram
     actor User as User / AI Agent
-    participant Interface as Interface Layer (CLI/MCP/VS Code)
-    participant Bridge as Bridge Server (bridge_server.py)
+    participant Interface as Interface Layer (CLI / MCP)
     participant Core as Core Orchestration (generator.py)
     participant RAG as AI & Knowledge (retriever.py)
+    participant VDB as ChromaDB (vector_store.py)
+    participant KG as Knowledge Graph (graph.py)
     participant LLM as LLM Client (llm_client.py)
     
     User->>Interface: Request test generation (PDF/TXT)
-    alt VS Code Extension
-        Interface->>Bridge: JSON-RPC over stdin/stdout
-        Bridge->>Core: Pass file path & parameters
-    else CLI / MCP
-        Interface->>Core: Pass file path & parameters
-    end
+    Interface->>Core: Pass file path & parameters
     Core->>Core: Parse and chunk document
-    Core->>RAG: Query Product Context
-    RAG-->>Core: Return historical context chunks
+    Core->>RAG: Hybrid retrieval query
+    RAG->>VDB: Dense search (HNSW cosine)
+    RAG->>RAG: Sparse search (BM25)
+    RAG->>RAG: Score fusion + CrossEncoder re-rank
+    RAG->>RAG: Parent-child expansion
+    RAG->>KG: Graph expansion (BFS neighbours)
+    RAG-->>Core: Return context chunks
     Core->>LLM: Send Prompt + Context
-    Note over LLM: Dispatches to Ollama, OpenAI, Google, or VS Code Copilot
+    Note over LLM: Dispatches to Ollama, OpenAI, Google, or GitHub Models
     LLM-->>Core: Return generated JSON
     Core->>Core: Sanitize, Validate, Deduplicate
     Core->>Interface: Save to outputs/ & return status
@@ -43,17 +44,13 @@ CaseCraft follows a modular three-tier architecture. Each layer has a clear resp
 
 The Interface Layer is the entry point for all interactions with CaseCraft. Whether a user runs a terminal command or an AI agent makes a tool call, this layer normalizes the request and hands it off to the Core Orchestration Layer. This separation ensures that the underlying test generation logic remains identical regardless of how CaseCraft is invoked.
 
-**`cli/main.py`** — The primary CLI entry point. It uses Python's `argparse` to accept commands like `generate`, along with flags such as `--model`, `--format`, `--no-dedup-semantic`, and `--reviewer`. It resolves configuration priority (CLI arguments override config file values, which override defaults), validates input file paths, calls `generate_test_suite()`, and exports results via `core/exporter.py`. This is the recommended way to run CaseCraft for local usage.
+**`cli/main.py`** — The primary CLI entry point. It uses Python's `argparse` to accept commands like `generate`, along with flags such as `--model`, `--format`, `--output` / `-o`, `--no-dedup-semantic`, `--reviewer` / `--quality`, and `--verbose`. It resolves configuration priority (CLI arguments override config file values, which override defaults), validates input file paths, calls `generate_test_suite()`, and exports results via `core/exporter.py`. After generation, it automatically unloads the model from Ollama memory to free resources. This is the recommended way to run CaseCraft for local usage.
 
 **`cli/ingest.py`** — The ingestion CLI for populating the RAG knowledge base. It supports four sub-commands: `sitemap` (crawl all pages from a sitemap.xml), `url` (ingest a single web page), `urls` (ingest URLs from a text file), and `docs` (ingest local PDF/TXT/MD files from a directory). Each source is parsed into `RawDocument` objects, chunked, embedded, and appended to the knowledge index.
 
 **`mcp_server/server.py`** — Exposes CaseCraft as an MCP (Model Context Protocol) server using FastMCP. It defines two tools: `generate_tests` and `query_knowledge`, which AI clients like AnythingLLM or Claude Desktop can invoke. The server implements critical security measures including path sandboxing (files must be in `features/`, `specs/`, or `docs/`), rate limiting (5-second cooldown between generation calls), input validation (app_type whitelist, query truncation), and lazy loading of heavy dependencies (PyTorch, SentenceTransformers) so that the MCP handshake completes instantly without timeout.
 
 **`casecraft_mcp.py`** — A thin wrapper script that adds the project root to `sys.path` and calls `mcp_server.server.main()`. This is the file you point your MCP client to when configuring the server.
-
-**`bridge_server.py`** — A JSON-RPC bridge that connects the VS Code extension to the Python core. It reads line-delimited JSON requests from stdin and writes responses to stdout. It exposes four methods: `generate` (run the full test-generation pipeline), `query` (search the RAG knowledge base), `ingest` (add documents to the index), and `get_config` (return the current configuration). Security hardening includes path traversal guards, file-extension allowlists, request-ID validation, JSON line size limits (10 MB), LLM response size limits (5 MB), sanitised error messages, API-key exclusion from config dumps, and cancellation support.
-
-**`vscode-casecraft/`** — A VS Code Chat Participant extension (TypeScript) that registers a `@casecraft` participant in GitHub Copilot Chat. It supports slash commands (`/generate`, `/query`, `/ingest`, `/config`) and freeform questions. The extension spawns `bridge_server.py` as a child process and routes LLM calls through VS Code's `vscode.lm.selectChatModels()` API, so it uses whichever Copilot model the user has available (GPT-4o, Claude Sonnet, Gemini, etc.) with no separate API key.
 
 ### Layer 2: Core Orchestration Layer
 
@@ -64,10 +61,11 @@ This is the central processing engine. It manages the entire pipeline: parsing d
 1. Parses the input document into text chunks using `core/parser.py`.
 2. Retrieves product context from the RAG knowledge base via `_retrieve_product_context()`.
 3. For each chunk, runs a condensation pass (`_condense_chunk()`) to distill the text into test-relevant bullet points, then builds a prompt and generates test cases via `_generate_single_suite()`.
-4. Processes all chunks in parallel using `ThreadPoolExecutor` (up to 4 workers) since LLM calls are I/O-bound.
-5. Post-processes results through a multi-stage pipeline: JSON sanitization (`_clean_json_output`), output normalization (`_normalize_test_cases`), field sanitization (`_sanitize_test_cases`), title cleaning (`_clean_test_case_titles`), exact deduplication (`_deduplicate_test_cases`), semantic deduplication (`_deduplicate_semantically`), checklist cross-referencing (if a companion `_checklist.txt` file exists), priority sorting (`_prioritize_test_cases`), and dependency validation (`_validate_dependencies`).
-6. Optionally runs a reviewer pass that sends the entire suite back to the LLM for polish.
-7. Returns a validated `TestSuite` Pydantic model.
+4. Checks each chunk against `min_cases_per_chunk` — if a chunk produces fewer test cases than the threshold, a supplementary LLM call is made focusing on edge cases, boundary values, and negative tests.
+5. Processes all chunks in parallel using `ThreadPoolExecutor` (up to 4 workers) since LLM calls are I/O-bound.
+6. Post-processes results through a multi-stage pipeline: JSON sanitization (`_clean_json_output`), output normalization (`_normalize_test_cases`), field sanitization (`_sanitize_test_cases`), title cleaning (`_clean_test_case_titles`), exact deduplication (`_deduplicate_test_cases`), semantic deduplication (`_deduplicate_semantically`), checklist cross-referencing (if a companion `_checklist.txt` file exists), priority sorting (`_prioritize_test_cases`), and dependency validation (`_validate_dependencies`).
+7. Optionally runs a reviewer pass that sends the entire suite back to the LLM for polish.
+8. Returns a validated `TestSuite` Pydantic model.
 
 **`core/parser.py`** — Handles document ingestion. Supports PDF (via `pypdf`), plain text, and Markdown files. It extracts raw text, cleans it (strips redundant whitespace, normalizes line endings), and splits it into overlapping chunks. The chunker prefers to break at whitespace boundaries so words are never split mid-token. Enforces a 50MB file size limit to prevent memory exhaustion.
 
@@ -84,17 +82,20 @@ All inputs are sanitized via `_sanitize_input()` which strips control characters
 
 **`core/config.py`** — Manages configuration loading with a three-level priority system: CLI arguments > Environment variables > YAML config file > Defaults. The config is defined as Pydantic models (`GeneralSettings`, `GenerationSettings`, `OutputSettings`, `QualitySettings`, `KnowledgeSettings`) and loaded from `casecraft.yaml`. Any setting can be overridden via environment variables using the convention `CASECRAFT_SECTION_KEY` (e.g., `CASECRAFT_GENERAL_MODEL`).
 
-**`core/exporter.py`** — Exports a `TestSuite` to Excel (`.xlsx` via openpyxl) or JSON format. Includes path traversal protection — output files must be within the configured `output_dir`.
+**`core/exporter.py`** — Exports a `TestSuite` to Excel (`.xlsx` via openpyxl) or JSON format. Includes path traversal protection — output files must be within the configured `output_dir`. The `_join_lines()` helper safely coerces non-string items to strings before joining.
 
-**`core/llm_client.py`** — A unified LLM adapter that routes generation requests to one of three backends based on config:
+**`core/cache.py`** — Thread-safe caching infrastructure with three specialised LRU caches: `CondensationCache` (caches LLM condensation results by content hash), `RetrievalCache` (caches RAG retrieval results by query hash with configurable TTL), and `PromptCache` (caches rendered Jinja2 templates by parameter hash). All caches support hit/miss stats tracking, `clear()`, and concurrent access via `threading.Lock`. BM25 disk persistence (`bm25_cache.pkl`) and secondary metadata indexes are also managed here.
+
+**`core/chunking.py`** — Shared chunking module used by both `core/parser.py` (for feature documents) and `core/knowledge/chunker.py` (for knowledge base ingestion). Provides `recursive_split()` with a separator hierarchy (`\n\n` → `\n` → `.` → `;` → `,` → ` ` → character) and section-aware splitting logic. This deduplication ensures consistent chunking behaviour across both pipelines.
+
+**`core/llm_client.py`** — A unified LLM adapter that routes generation requests to one of four backends based on config:
 
 - **Ollama** (native `/api/generate` endpoint) — For locally hosted models.
 - **OpenAI-compatible** (`/v1/chat/completions`) — Works with LM Studio, LocalAI, vLLM, and any OpenAI-compatible API.
 - **Google Gemini** (REST API) — For Google's cloud models.
+- **GitHub Models** (`copilot` provider) — Routes through GitHub's Models API at `https://models.github.ai/inference`. Supports GPT-4o, GPT-4.1, GPT-5, o3-mini, o4-mini, DeepSeek-R1, Llama, Phi-4, Grok, and more. Requires a GitHub PAT with `models:read` scope.
 
-Each backend handler constructs the appropriate payload with temperature, top_p, max output tokens, and context window settings. It warns if API keys are transmitted over unencrypted HTTP to non-localhost addresses.
-
-- **VS Code Copilot** (via callback proxy) — When running inside the VS Code extension, LLM calls are routed through `bridge_server.py` back to the extension's `vscode.lm` API. This lets CaseCraft use whichever Copilot model the user has (GPT-4o, Claude Sonnet, Gemini) with zero API-key configuration.
+Each backend handler constructs the appropriate payload with temperature, top_p, max output tokens, and context window settings. It warns if API keys are transmitted over unencrypted HTTP to non-localhost addresses. After generation completes, the client can unload models from Ollama memory via `unload_model()` to free resources.
 
 ### Layer 3: AI & Knowledge Layer (RAG)
 
@@ -102,23 +103,44 @@ This layer handles all embedding, storage, and retrieval of product knowledge th
 
 **`core/knowledge/models.py`** — Defines two data classes: `RawDocument` (text + source metadata before chunking) and `KnowledgeChunk` (text + metadata + optional embedding vector after chunking).
 
-**`core/knowledge/chunker.py`** — Splits `RawDocument` text into `KnowledgeChunk` objects. Unlike the parser's character-based chunking, this chunker splits by paragraphs first, then merges paragraphs into chunks up to a configurable `max_chars` limit (default 1500 characters, configurable via `knowledge.kb_chunk_size`). This preserves semantic boundaries.
+**`core/knowledge/chunker.py`** — Splits `RawDocument` text into `KnowledgeChunk` objects using three strategies:
 
-**`core/knowledge/embedder.py`** — Generates dense vector embeddings using SentenceTransformers (`all-MiniLM-L6-v2` by default). Supports batch processing with progress bars. When the retriever is already loaded, the embedder reuses the same model instance to save memory.
+- **Section-aware chunking** — Splits by paragraphs, then merges into chunks up to a configurable `max_chars` limit (default 1500 characters via `knowledge.kb_chunk_size`), preserving semantic boundaries.
+- **Recursive chunking** — Uses a separator hierarchy (`\n\n` → `\n` → `.` → `;` → `,` → ` ` → character) to split oversized sections, progressively falling back to finer-grained separators.
+- **Parent-child chunking** — Two-tier strategy where large parent chunks (for rich context) are sub-split into small child chunks (for retrieval precision). Child chunks carry `parent_id` metadata so the retriever can expand them back to parent context at query time. Enabled via `knowledge.parent_child_chunking`.
 
-**`core/knowledge/retriever.py`** — The advanced retrieval engine using Hybrid Search. On startup the retriever runs an **integrity check (R3)**: it verifies the SHA-256 hash of `index.json` against a stored `.sha256` sibling file and raises `RetrievalError` if the index has been tampered with or corrupted. The retrieval stages are:
+**`core/knowledge/vector_store.py`** — Persistent vector storage backed by **ChromaDB**. Wraps a `chromadb.PersistentClient` with HNSW cosine-distance indexing. Provides `add_chunks()`, `query()`, `get_by_ids()`, `get_all()`, and `reset_collection()` methods. Includes an auto-migration path from the legacy flat JSON index (`knowledge_base/index.json`) to ChromaDB on first access.
 
-1. **Dense Search** — Cosine similarity between query and document embeddings (weighted at 0.7 by default).
+**`core/knowledge/graph.py`** — A lightweight **knowledge graph** built with `networkx`. At ingest time, `KnowledgeGraph.build_from_chunks()` constructs a directed graph with four relation types:
+
+1. **`parent_of`** — Links parent chunks to their child chunks (from parent-child chunking metadata).
+2. **`same_source`** — Links consecutive chunks from the same source document.
+3. **`cross_reference`** — Links chunks that mention another document's source name in their text.
+4. **`shared_entity`** — Links chunks that share significant noun phrases, acronyms, or quoted terms (lightweight entity extraction without spaCy).
+
+The graph persists to JSON via `networkx.readwrite.json_graph` and supports BFS traversal (`get_related_ids()`) with configurable max hops and optional relation filtering.
+
+**`core/knowledge/embedder.py`** — Generates dense vector embeddings using SentenceTransformers (`all-MiniLM-L6-v2` by default, 384 dimensions). Supports batch processing with progress bars. When the retriever is already loaded, the embedder reuses the same model instance to save memory.
+
+**`core/knowledge/retriever.py`** — The advanced hybrid retrieval engine. Init is near-instant (~0.05s) because ChromaDB persists on disk and ML models are loaded lazily in a background thread. The retrieval pipeline has seven stages:
+
+1. **Dense Search** — HNSW cosine similarity via ChromaDB (weighted at 0.7 by default).
 2. **Sparse Search (BM25)** — Keyword-based scoring via `rank_bm25` (weighted at 0.3 by default).
 3. **Score Fusion** — Combines dense and sparse scores with configurable weights.
 4. **Cross-Encoder Re-ranking** — Optionally re-ranks the top candidates using `cross-encoder/ms-marco-MiniLM-L-6-v2` for improved precision.
-5. **Filtering** — Applies minimum score threshold and metadata filters.
+5. **Parent-Child Expansion** — Replaces matched child chunks with their richer parent chunks for broader context.
+6. **Knowledge Graph Expansion** — Appends structurally related chunks (same source, cross-references, shared entities) found via BFS traversal of the knowledge graph, catching connections that embedding similarity misses.
+7. **Filtering** — Applies minimum score threshold and metadata filters.
 
-Supports `top_k=-1` to retrieve all chunks from the knowledge base.
+Also supports **batched multi-query retrieval**: long feature texts are decomposed into sub-queries, batch-encoded, and fused via max-score aggregation before re-ranking. Supports `top_k=-1` to retrieve all chunks.
 
 **`core/knowledge/loader.py`** — Scans a directory for supported files (PDF, MD, TXT), extracts text using `core/parser.py`, and wraps each file as a `RawDocument` with automatically inferred source types (feature_doc, system_rule, product_doc).
 
 **`core/knowledge/web_loader.py`** — Fetches content from web sources. Supports sitemap crawling (with configurable delay, max pages, and URL exclusion patterns), single URL loading, and batch URL loading from text files. Implements SSRF protection: blocks private/internal IPs, validates DNS resolution, rejects non-HTTP schemes, and limits redirect chains.
+
+**`core/knowledge/ingest.py`** — Orchestrates the full ingestion pipeline: loads documents via `loader.py` or `web_loader.py`, chunks them via `chunker.py`, embeds via `embedder.py`, stores in ChromaDB via `vector_store.py`, and optionally builds the knowledge graph via `graph.py`. Returns an `IngestResult` with chunk count, source count, and graph statistics.
+
+**`core/knowledge/integrity.py`** — SHA-256 hash-based integrity verification for the legacy `index.json` migration path. Provides `compute_hash()`, `write_hash()`, and `verify_hash()` functions to detect tampering or corruption of the flat JSON index before migrating chunks to ChromaDB.
 
 ---
 
@@ -135,14 +157,12 @@ Supports `top_k=-1` to retrieve all chunks from the knowledge base.
 | **Prompt Templating** | `jinja2` | Rendering parameterized prompts for the LLM |
 | **Embeddings** | `sentence-transformers` (`all-MiniLM-L6-v2`) | Generating dense vector embeddings for RAG retrieval and semantic deduplication |
 | **Re-ranking** | `sentence-transformers` (`cross-encoder/ms-marco-MiniLM-L-6-v2`) | Cross-encoder re-ranking of retrieval candidates for higher precision |
+| **Vector Database** | `chromadb` (v≥0.5.0) | Persistent HNSW vector store with cosine distance indexing |
+| **Knowledge Graph** | `networkx` (v≥3.1) | In-memory directed graph for cross-document chunk relationship tracing |
 | **Sparse Search** | `rank-bm25` | BM25Okapi keyword scoring for hybrid search |
 | **Web Scraping** | `beautifulsoup4` | HTML-to-text extraction for web ingestion |
 | **XML Parsing** | `defusedxml` | Safe sitemap.xml parsing (prevents XXE attacks) |
 | **MCP Server** | `mcp` (FastMCP) | Model Context Protocol server for AI agent integration |
-| **VS Code Extension** | TypeScript, `vscode` API | Chat Participant extension for GitHub Copilot Chat integration |
-| **LM Bridge** | `vscode.lm.selectChatModels()` | Routes LLM calls through VS Code Copilot models (GPT-4o, Claude, Gemini) |
-| **Extension Bundler** | `esbuild` | Bundles TypeScript extension into a single optimised JS file |
-| **Bridge Protocol** | Line-delimited JSON (stdin/stdout) | Communication between the VS Code extension and Python backend |
 | **Numerical** | `numpy` | Matrix operations for cosine similarity and score computation |
 | **Progress Display** | `tqdm` | Progress bars for multi-chunk generation and batch processing |
 
@@ -153,8 +173,6 @@ Supports `top_k=-1` to retrieve all chunks from the knowledge base.
 - **SentenceTransformers** provides high-quality local embeddings without requiring an API key or internet connection.
 - **Hybrid Search (BM25 + Dense)** catches both exact keyword matches and semantic similarities, outperforming either approach alone.
 - **FastMCP** enables zero-code integration with AI assistants like Claude Desktop and AnythingLLM.
-- **VS Code Chat Participant** brings CaseCraft into the editor where developers already work, using Copilot models with zero API-key overhead.
-- **esbuild** compiles and bundles the TypeScript extension in milliseconds, keeping the development loop fast.
 
 ---
 
@@ -162,11 +180,13 @@ Supports `top_k=-1` to retrieve all chunks from the knowledge base.
 
 CaseCraft has been enhanced with the following features and optimizations:
 
-### Dynamic Context Window Management
+### Dynamic Token Allocation with Per-Model Caps
 
-- **Auto-detection**: Automatically detects the model's native context window from Ollama API (`/api/show`)
-- **Configurable cap**: Prevents OOM errors by capping at `max_context_window` (default 32K)
-- **Auto-scaled output tokens**: `max_output_tokens=-1` auto-scales based on `output_token_ratio` of context window
+- **Auto-detection**: Automatically detects the model's native context window from Ollama API (`/api/show`); cloud models use per-model specs from `MODEL_SPECS`
+- **Context window ratio**: `context_window_ratio` (0.0–1.0) controls how much of the native window to use — e.g., 0.75 = 75%
+- **Dynamic output tokens**: Output token budget is computed dynamically from the actual prompt size — small prompts get more output budget, large prompts get less
+- **Per-model caps**: Each model in `MODEL_SPECS` has a hard output ceiling (e.g., gpt-4o: 16,384) that prevents 400 errors from the provider
+- **Minimum guarantee**: `min_output_tokens` (default 1024) ensures output is never starved even with very large prompts
 
 ### Advanced RAG Query Transformations
 
@@ -179,6 +199,7 @@ CaseCraft has been enhanced with the following features and optimizations:
 - **HTTP retry with exponential backoff**: Transient errors (429, 503, 504) trigger automatic retries with jitter
 - **Thread-safe singletons**: Retriever and embedder instances use double-checked locking
 - **Schema validation**: Priority and test_type fields are normalized and validated with `Literal` types
+- **Robust LLM output normalization**: `_coerce_str_list()` handles malformed LLM responses where list fields (steps, preconditions, expected_results) contain dicts instead of strings — e.g., `[{"step": 1, "action": "Click"}]` is flattened to `["step: 1, action: Click"]`. Mixed-type lists and bare strings are also handled gracefully
 
 ### Better User Experience
 
@@ -186,25 +207,53 @@ CaseCraft has been enhanced with the following features and optimizations:
 - **Structured logging**: All `print()` calls replaced with Python's `logging` module
 - **Configurable verbosity**: Use `--verbose` flag for debug output
 
+### ChromaDB Vector Store
+
+- **Persistent HNSW indexing**: Replaced the flat JSON index with ChromaDB's persistent client, providing HNSW approximate nearest-neighbour search with cosine distance
+- **Auto-migration**: On first access, if ChromaDB is empty but a legacy `knowledge_base/index.json` exists, chunks are automatically migrated
+- **Batch operations**: `add_chunks()`, `query()`, `get_by_ids()`, `get_all()`, and `reset_collection()` with proper error handling
+
+### Advanced Chunking Strategies
+
+- **Recursive chunking**: Separator hierarchy (`\n\n` → `\n` → `.` → `;` → `,` → ` ` → char) for intelligent text splitting that respects natural boundaries
+- **Parent-child chunking**: Two-tier strategy — small child chunks (default 400 chars) for retrieval precision, large parent chunks (default 1500 chars) returned for richer LLM context. Configurable via `casecraft.yaml`
+- **Config-driven**: Parent-child chunking, child size, and overlap are all controlled from `casecraft.yaml` — no CLI flags needed
+
+### Knowledge Graph Layer
+
+- **Lightweight relation graph**: Built with `networkx` at ingest time over all chunks in the knowledge base
+- **Four relation types**: `parent_of` (parent-child metadata), `same_source` (consecutive chunks), `cross_reference` (text mentions another document), `shared_entity` (common noun phrases / acronyms)
+- **Graph-expanded retrieval**: At query time, BFS traversal (configurable max hops) appends structurally related chunks that embedding similarity might miss
+- **Entity extraction**: Lightweight regex-based extraction of capitalised phrases, quoted terms, and ALL-CAPS acronyms — no spaCy dependency
+- **Persistence**: Graph saved/loaded as JSON via `networkx.readwrite.json_graph`
+
+### Rate Limit Mitigation
+
+- **Inter-call throttle**: `llm_call_delay` enforces a thread-safe minimum gap (seconds) between consecutive LLM API calls, preventing burst rate-limit (429) errors
+- **Configurable parallelism**: `max_workers` controls the number of concurrent chunk-generation threads. Set to 1 for rate-limited providers like GitHub Models free tier (10-15 RPM)
+- **Recommended copilot settings**: `max_workers: 1`, `llm_call_delay: 8` for the GitHub Models free tier
+
+### Caching & Indexing
+
+- **Condensation cache**: LLM condensation results are cached by chunk content hash (SHA-256). When overlapping or repeated chunks appear, the cached condensation is returned without an LLM roundtrip — high-impact for large documents with chunk overlap
+- **Retrieval cache**: RAG retrieval results are cached by query + top_k hash with configurable TTL. Similar or identical queries from overlapping feature chunks reuse cached results without re-running the hybrid pipeline (dense + sparse + rerank)
+- **Prompt template cache**: Rendered Jinja2 templates are cached by parameter hash. Minor speedup, avoids redundant rendering for identical prompt parameters
+- **BM25 index persistence**: The BM25 sparse index is serialised to `bm25_cache.pkl` on first build and loaded from disk on subsequent startups — skips the full rebuild when the knowledge base hasn't changed (saves 1-5s depending on KB size)
+- **Secondary metadata indexes**: Source-file and chunk-type inverted indexes are built alongside BM25 at startup for O(1) lookup by source document or chunk type
+- **Jinja2 optimisation**: Templates are pre-compiled at module load with `auto_reload=False` — no filesystem stat checks during generation
+
 ### Code Quality
 
 - **Shared chunking module**: Deduplicated chunking logic between parser and knowledge base
-- **99 unit tests**: Comprehensive coverage for core functions including `_clean_json_output`, `_sanitize_test_cases`, deduplication, config loading, export, prompt-injection fencing, and index integrity hashing
-- **Type hints throughout**: Full type annotations for better IDE support
-
-### VS Code Chat Participant Extension
-
-- **`@casecraft` in Copilot Chat**: Invoke CaseCraft directly from the editor chat panel with `/generate`, `/query`, `/ingest`, `/config`, or freeform questions
-- **Copilot model routing**: Uses `vscode.lm.selectChatModels()` to leverage whichever models are available (GPT-4o, Claude Sonnet, Gemini) — no API key or local LLM required
-- **Bridge server**: A JSON-RPC bridge (`bridge_server.py`) connects the TypeScript extension to the Python core over stdin/stdout with cancellation support, progress streaming, and buffer-overflow guards
-- **Packaged as VSIX**: Installable via `code --install-extension vscode-casecraft-0.1.0.vsix`
+- **168 unit tests**: Comprehensive coverage for core functions including chunking, knowledge graph construction/traversal/persistence, vector store, config loading, export, caching, prompt-injection fencing, and security
+- **Type hints throughout**: Full type annotations for better IDE support and Pyright compliance
 
 ### Security Hardening
 
 - **Path traversal guards**: All file parameters are validated to be within the project root
 - **File extension allowlist**: Only `.pdf`, `.txt`, `.md` files accepted for ingestion and generation
 - **Prompt-injection fencing (R1)**: Regex-based heuristics detect instruction-override attempts, role reassignment, fake message boundaries, prompt leakage requests, and jailbreak phrases — flagged lines are wrapped with data-fence markers in all Jinja2 templates
-- **Index integrity hashing (R3)**: SHA-256 hash written alongside `index.json` on every ingest; the retriever verifies the hash at load time and rejects tampered or corrupted indices
+- **Index integrity hashing (R3)**: SHA-256 hash verification for the legacy `index.json` ingestion path; ensures tampered or corrupted indices are rejected during auto-migration to ChromaDB
 - **Input size limits**: JSON request lines capped at 10 MB, LLM responses at 5 MB, user text at 500K characters
 - **Sanitised errors**: Internal paths and stack traces are never exposed to users
 - **API key protection**: Keys excluded from config dumps and diagnostic output
@@ -220,17 +269,14 @@ All settings are managed in `casecraft.yaml`. Every value can be overridden via 
 | Setting | Default | Description |
 |---|---|---|
 | `model` | `llama3.1:8b` | The LLM model identifier. Must match a model available on your provider. |
-| `llm_provider` | `ollama` | Backend provider: `ollama`, `openai`, or `google`. |
+| `llm_provider` | `ollama` | Backend provider: `ollama`, `openai`, `google`, or `copilot`. |
 | `base_url` | `http://localhost:11434` | API endpoint URL for the LLM provider. |
 | `api_key` | `ollama` | API key (use env var `CASECRAFT_GENERAL_API_KEY` for real keys). |
-| `context_window_size` | `-1` | Context window in tokens. `-1` enables auto-detection from Ollama API. |
-| `max_context_window` | `32768` | Maximum cap for auto-detected context windows. Prevents OOM on limited RAM. |
-| `auto_detect_context_window` | `true` | Auto-detect model's native context window from Ollama API. |
+| `context_window_ratio` | `0.75` | Fraction of the model's native context window to use (0.0-1.0). Auto-detected for Ollama; cloud models use per-model specs from `MODEL_SPECS`. |
+| `min_output_tokens` | `1024` | Minimum guaranteed output tokens. Output allocation is dynamic based on prompt size; this floor prevents starvation. Per-model caps enforced automatically. |
 | `max_retries` | `2` | Number of retry attempts when the LLM generates invalid JSON. |
-| `max_output_tokens` | `-1` | Maximum tokens the LLM can generate per call. `-1` enables auto-scaling. |
-| `max_output_tokens_cap` | `8192` | Upper cap for auto-scaled output tokens. |
-| `output_token_ratio` | `0.25` | Fraction of context window allocated to output when auto-scaling (0.0-0.5). |
 | `timeout` | `600` | Request timeout in seconds for LLM API calls. |
+| `llm_call_delay` | `0` | Minimum seconds between consecutive LLM API calls. Prevents rate-limit (429) errors on providers with strict RPM caps. Set to 6-8 for GitHub Models free tier. |
 
 ### Generation Settings
 
@@ -241,6 +287,8 @@ All settings are managed in `casecraft.yaml`. Every value can be overridden via 
 | `temperature` | `0.2` | LLM creativity (0.0-1.0). Low values produce deterministic, structured output. Recommended to keep at 0.1-0.3 for reliable JSON generation. |
 | `top_p` | `0.5` | Nucleus sampling. Controls the diversity of token selection. Lower values make output more focused. |
 | `app_type` | `web` | Application type: `web`, `mobile`, `desktop`, or `api`. When set to `mobile`, the prompt includes mobile-specific test scenarios (touch gestures, orientation, interruptions, offline mode, etc.). |
+| `max_workers` | `4` | Maximum parallel threads for chunk generation. Set to 1 for rate-limited providers to avoid concurrent API calls. |
+| `min_cases_per_chunk` | `5` | Minimum test cases expected per chunk. If a chunk produces fewer cases, a supplementary LLM call targets edge cases, boundary values, and negative tests. Set to 0 to disable. |
 
 ### Output Settings
 
@@ -263,11 +311,32 @@ All settings are managed in `casecraft.yaml`. Every value can be overridden via 
 
 | Setting | Default | Description |
 |---|---|---|
+| `vector_db_path` | `knowledge_base/chroma_db` | ChromaDB persistence directory for the vector store. |
 | `kb_chunk_size` | `1500` | Maximum characters per knowledge base chunk during ingestion. Controls chunk granularity in the RAG index. |
 | `min_score_threshold` | `0.1` | Minimum hybrid retrieval score to include a result (0.0-1.0). Set to `0.0` to include all chunks when `top_k` is `-1`. |
 | `query_decomposition` | `true` | Decompose long queries into focused sub-queries for better retrieval. |
 | `query_expansion` | `true` | Expand queries with domain synonyms for improved recall. |
 | `max_sub_queries` | `4` | Maximum sub-queries when decomposition is enabled. |
+| `parent_child_chunking` | `false` | Enable two-tier parent-child chunking. Small child chunks are used for retrieval precision; parent chunks are returned for richer context. |
+| `child_chunk_size` | `400` | Max characters per child chunk when parent-child chunking is enabled. |
+| `child_overlap` | `50` | Character overlap between adjacent child chunks of the same parent. |
+| `knowledge_graph` | `false` | Build a lightweight relation graph over chunks at ingest time. Enables graph-expanded retrieval for cross-document tracing. Requires `networkx`. |
+| `graph_path` | `knowledge_base/knowledge_graph.json` | Path for the persisted knowledge graph JSON file. |
+| `graph_max_hops` | `2` | Maximum BFS hops when expanding retrieval results via the knowledge graph. |
+| `graph_max_expansion` | `3` | Maximum number of graph-expanded chunks appended to retrieval results. |
+
+### Cache Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `enable_condensation_cache` | `true` | Cache LLM condensation results by content hash. Avoids redundant LLM calls for overlapping or repeated chunks. |
+| `enable_retrieval_cache` | `true` | Cache RAG retrieval results by query hash. Avoids redundant hybrid search for similar queries. |
+| `enable_prompt_cache` | `true` | Cache rendered Jinja2 prompt templates by parameter hash. |
+| `condensation_cache_size` | `256` | Max entries in condensation LRU cache. |
+| `retrieval_cache_size` | `64` | Max entries in retrieval LRU cache. |
+| `retrieval_cache_ttl` | `300.0` | TTL for retrieval cache entries in seconds. `0` = no expiry. |
+| `prompt_cache_size` | `32` | Max entries in prompt template LRU cache. |
+| `persist_bm25_index` | `true` | Persist BM25 sparse index to disk. Skips rebuild on startup when KB is unchanged. |
 
 ---
 
@@ -371,6 +440,26 @@ general:
 set CASECRAFT_GENERAL_API_KEY=your-google-api-key
 ```
 
+**GitHub Models (Copilot provider)** — Access cloud models (GPT-4o, o3-mini, DeepSeek-R1, Llama, Phi-4, Grok, etc.) through GitHub's Models API. No local LLM required:
+
+```yaml
+general:
+  llm_provider: "copilot"
+  model: "gpt-4o"   # or gpt-4o-mini, o3-mini, DeepSeek-R1, Phi-4, etc.
+```
+
+Set a GitHub Personal Access Token with `models:read` scope:
+
+```bash
+# Windows
+set GITHUB_TOKEN=ghp_your_token_here
+
+# Linux/Mac
+export GITHUB_TOKEN=ghp_your_token_here
+```
+
+Available models include: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o3-mini`, `o4-mini`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `Meta-Llama-3.1-405B-Instruct`, `Meta-Llama-3.1-70B-Instruct`, `DeepSeek-R1`, `DeepSeek-R1-0528`, `Phi-4`, `MAI-DS-R1`, `Mistral-large`, `Mistral-small`, `xai-grok-3`, `xai-grok-3-mini`, and more. See [GitHub Models Marketplace](https://github.com/marketplace/models) for the full list.
+
 ### CLI Usage
 
 ```bash
@@ -389,6 +478,9 @@ python cli/main.py generate features/your_feature.pdf --no-dedup-semantic
 # Enable the AI reviewer pass
 python cli/main.py generate features/your_feature.pdf --reviewer
 
+# Specify custom output path
+python cli/main.py generate features/your_feature.pdf --output my_tests.xlsx
+
 # Verbose mode (shows tracebacks on errors)
 python cli/main.py generate features/your_feature.pdf --verbose
 ```
@@ -403,9 +495,9 @@ The RAG (Retrieval-Augmented Generation) system gives CaseCraft awareness of you
 
 ### How It Works
 
-1. **Ingestion**: Documents are parsed (PDF, TXT, MD, or web pages), split into semantically meaningful paragraph-based chunks, and embedded as dense vectors using SentenceTransformers.
-2. **Storage**: Embedded chunks are stored in `knowledge_base/index.json` as a flat JSON array. Each entry contains the chunk text, metadata, and its embedding vector.
-3. **Retrieval**: During test generation, the feature document text is used as a query. The retriever performs hybrid search (BM25 keyword + dense semantic) with optional cross-encoder re-ranking to find the most relevant knowledge chunks.
+1. **Ingestion**: Documents are parsed (PDF, TXT, MD, or web pages), split into semantically meaningful chunks (section-aware, recursive, or parent-child), embedded as dense vectors using SentenceTransformers, and stored in ChromaDB. Optionally, a knowledge graph is built over the chunks to capture cross-document relationships.
+2. **Storage**: Chunks and their embeddings are stored in a **ChromaDB persistent vector store** (`knowledge_base/chroma_db/`) with HNSW cosine-distance indexing. The optional knowledge graph is persisted as a JSON file (`knowledge_base/knowledge_graph.json`).
+3. **Retrieval**: During test generation, the feature document text is used as a query. The retriever performs a seven-stage pipeline: HNSW dense search → BM25 sparse search → score fusion → CrossEncoder re-ranking → parent-child expansion → knowledge graph expansion → filtering.
 4. **Context Injection**: Retrieved chunks are formatted as numbered context blocks and appended to the generation prompt.
 
 Ingestion is **cumulative** — each run appends to the existing index. Previously ingested documents are never overwritten.
@@ -443,24 +535,26 @@ python cli/ingest.py sitemap https://docs.example.com/sitemap.xml \
     --exclude /api/ /blog/
 ```
 
-### Custom Index Path
+### Custom Vector Store Path
 
 ```bash
-python cli/ingest.py docs ./docs/ --index knowledge_base/custom_index.json
+python cli/ingest.py docs ./docs/ --db-path knowledge_base/custom_chroma_db
 ```
 
 ### Clearing and Rebuilding the Index
 
 There is no single-document delete. To rebuild from scratch:
 
-```bash
-# Windows
-del knowledge_base\index.json
-del knowledge_base\index.json.sha256
+```powershell
+# Windows (PowerShell)
+Remove-Item -Recurse -Force knowledge_base\chroma_db
+Remove-Item -Force knowledge_base\knowledge_graph.json
+```
 
+```bash
 # Linux/Mac
-rm knowledge_base/index.json
-rm knowledge_base/index.json.sha256
+rm -rf knowledge_base/chroma_db
+rm -f knowledge_base/knowledge_graph.json
 ```
 
 Then re-ingest:
@@ -483,26 +577,19 @@ knowledge:
 
 To increase knowledge chunk granularity during ingestion, adjust `kb_chunk_size` in the `knowledge` section and re-ingest your documents.
 
-### Why Flat JSON Instead of ChromaDB?
+### Why ChromaDB?
 
-CaseCraft stores its knowledge index as a single flat JSON file (`knowledge_base/index.json`) rather than using a vector database like ChromaDB. This is a deliberate design choice:
+CaseCraft uses **ChromaDB** as its persistent vector store, combined with a BM25 sparse index and an optional knowledge graph:
 
-| Consideration | Flat JSON + NumPy | ChromaDB |
+| Component | Technology | Purpose |
 |---|---|---|
-| **Hybrid search** | BM25 keyword (30% weight) + dense cosine (70% weight) + optional CrossEncoder re-ranking | Dense-only by default; no native BM25. Custom BM25 requires significant integration work |
-| **Dependencies** | NumPy (already required) + rank_bm25 (~50 KB) | Adds ~300 MB of transitive dependencies (hnswlib, onnxruntime, clickhouse-connect, etc.) |
-| **Search latency** | ~2 ms brute-force cosine over 4,258 chunks | ~1 ms ANN — negligible difference at this scale |
-| **Portability** | A single `.json` file — easy to copy, version, or inspect | Requires a running service or local SQLite + parquet files |
-| **Integrity** | SHA-256 hash verification on every load | No built-in tamper detection |
-| **Index transparency** | Human-readable JSON; easy to debug or audit | Binary/opaque storage format |
+| **Dense search** | ChromaDB HNSW (cosine) | Fast approximate nearest-neighbour retrieval (0.7 weight) |
+| **Sparse search** | BM25Okapi (`rank_bm25`) | Keyword-based scoring for exact term matches (0.3 weight) |
+| **Re-ranking** | CrossEncoder (`ms-marco-MiniLM-L-6-v2`) | Precision re-ranking of top candidates |
+| **Parent-child** | Metadata-driven expansion | Retrieve precise child chunks, return richer parent context |
+| **Knowledge graph** | networkx (BFS traversal) | Cross-document tracing via structural relationships |
 
-**Bottom line:** At the current scale (~4,000 chunks, ~52 MB), brute-force NumPy search is fast enough, and the hybrid BM25 + dense scoring produces measurably better retrieval quality than dense-only search. Switching to ChromaDB would *remove* the BM25 signal (30% of the scoring) and add heavyweight dependencies for less than 1 ms of speed-up.
-
-#### When to Consider ChromaDB (or FAISS)
-
-- **> 20,000 chunks**: Brute-force cosine similarity starts to add noticeable latency (> 50 ms). At this point, an approximate nearest-neighbour (ANN) index becomes worthwhile.
-- **Multi-user / server deployment**: If CaseCraft is ever served as a shared service, a proper vector store handles concurrent reads and writes more safely than file-based JSON.
-- **Recommendation**: If you outgrow flat JSON, consider **FAISS** (`faiss-cpu`) first — it adds ANN indexing without sacrificing the existing BM25 hybrid pipeline, and the dependency footprint is much smaller than ChromaDB.
+ChromaDB provides persistent HNSW indexing with sub-millisecond query latency while the BM25 layer ensures keyword matches are not lost. The knowledge graph adds a structural dimension that pure embedding similarity cannot capture — linking chunks that share entities, reference each other's source documents, or belong to the same parent.
 
 ---
 
@@ -517,88 +604,6 @@ When `app_type` is set to `mobile` in `casecraft.yaml`, CaseCraft activates mobi
    **Columns**: Capabilities, Android, iOS, Supported (online/offline), Supported Attributes (Android), Yet to Support (Android), Supported Attributes (iOS), Yet to Support (iOS), Remarks.
 
    Keep this file updated as mobile platform support evolves.
-
----
-
-## VS Code Extension (Chat Participant)
-
-CaseCraft can run as a **Chat Participant** inside GitHub Copilot Chat, letting you generate test suites, query the knowledge base, and ingest documents without leaving your editor. It uses whichever Copilot model you have access to (GPT-4o, Claude Sonnet, Gemini) — no separate API key or local LLM required.
-
-### Prerequisites
-
-- VS Code **1.93.0** or later
-- GitHub Copilot Chat extension installed and signed in
-- Python 3.10+ on `PATH`
-- CaseCraft Python dependencies installed (`pip install -r requirements-runtime.txt`)
-
-### Installing the Extension
-
-```bash
-# From the repo root, build the VSIX
-cd vscode-casecraft
-npm install
-npm run package          # produces vscode-casecraft-0.1.0.vsix
-
-# Install into VS Code
-code --install-extension vscode-casecraft-0.1.0.vsix
-```
-
-Or install the pre-built VSIX if available:
-
-```bash
-code --install-extension vscode-casecraft-0.1.0.vsix
-```
-
-### Using CaseCraft in Copilot Chat
-
-Open the Copilot Chat panel and type `@casecraft` followed by a command:
-
-```
-@casecraft /generate features/login.pdf
-@casecraft /generate features/checkout.txt --app-type mobile --reviewer
-@casecraft /query How does the password reset flow work?
-@casecraft /ingest docs/product_spec.pdf
-@casecraft /config
-@casecraft What test types should I cover for a payment API?
-```
-
-**Slash commands:**
-
-| Command | Description |
-|---|---|
-| `/generate <file>` | Generate a test suite from a feature document. Supports `--format`, `--app-type`, `--reviewer` flags. |
-| `/query <text>` | Search the RAG knowledge base for relevant product information. |
-| `/ingest <file>` | Add a document to the knowledge base index. |
-| `/config` | Show the current CaseCraft configuration. |
-| *(freeform)* | Ask a QA-related question — CaseCraft will answer using RAG context. |
-
-### Configuration for VS Code Extension
-
-When using CaseCraft as a VS Code extension, LLM calls are routed through the Copilot API — **no API key or base URL is needed**. Set the following in your `casecraft.yaml`:
-
-```yaml
-general:
-  llm_provider: "vscode"     # Routes LLM calls through VS Code Copilot
-  model: "gpt-4o"             # Substring-matched against available Copilot models
-  api_key: ""                 # Not used — leave blank
-  base_url: ""                # Not used — leave blank
-```
-
-| Field | Value | Why |
-|---|---|---|
-| `llm_provider` | `"vscode"` | Tells the Python backend to proxy LLM calls through the VS Code extension instead of calling an API directly. |
-| `model` | `"gpt-4o"`, `"claude-3.5-sonnet"`, `"gemini"`, etc. | Fuzzy-matched against your available Copilot models. Falls back to the first available model if no match. |
-| `api_key` | `""` (empty) | Authentication is handled by your GitHub Copilot subscription — no separate key required. |
-| `base_url` | `""` (empty) | The extension uses the native `vscode.lm` API, not an HTTP endpoint. |
-
-### Extension Settings
-
-The extension also exposes configuration under `casecraft.*` in VS Code Settings:
-
-| Setting | Default | Description |
-|---|---|---|
-| `casecraft.pythonPath` | `python` | Path to the Python interpreter. |
-| `casecraft.projectRoot` | Workspace root | Path to the CaseCraft project directory. |
 
 ---
 
@@ -620,7 +625,8 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "casecraft": {
       "command": "python",
-      "args": ["c:\\path\\to\\casecraft\\casecraft_mcp.py"]
+      "args": ["c:\\path\\to\\casecraft\\casecraft_mcp.py"],
+      "timeout": 600
     }
   }
 }
@@ -644,6 +650,122 @@ The MCP server enforces:
 - **Rate limiting**: 5-second cooldown between generation calls.
 - **Input validation**: App type whitelist, query length truncation.
 - **Lazy loading**: Heavy ML dependencies load on first tool call, not at startup.
+- **Keep-alive pings**: 15-second interval progress pings during long-running generation and query operations prevent MCP client timeouts.
+- **Dual export**: `generate_tests` always saves output in both JSON and Excel formats with timestamps.
+
+---
+
+## GitHub Copilot CLI Integration
+
+CaseCraft integrates natively with **GitHub Copilot CLI** as an MCP server. This lets you generate test suites and query the knowledge base using natural language directly from your terminal.
+
+### Prerequisites
+
+- [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli) installed
+- Any GitHub Copilot plan (Free, Pro, Pro+, Business, Enterprise)
+- Python 3.10+ with CaseCraft dependencies installed
+
+### Setup
+
+CaseCraft is registered as an MCP server in `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "CaseCraft": {
+      "command": "python",
+      "args": ["c:\\path\\to\\casecraft\\casecraft_mcp.py"],
+      "env": {},
+      "timeout": 600
+    }
+  }
+}
+```
+
+Or add interactively inside Copilot CLI:
+
+```
+/mcp add
+```
+
+### Usage
+
+**Interactive mode** — navigate to the project root and run:
+
+```bash
+copilot
+```
+
+Then type prompts like:
+
+- `Generate tests for features/login_feature.txt using CaseCraft`
+- `Query the CaseCraft knowledge base for authentication requirements`
+
+**Programmatic mode** — single-shot from terminal:
+
+```bash
+copilot -p "Use CaseCraft to generate tests for features/login.txt" --allow-tool "CaseCraft"
+```
+
+**Autonomous mode** — fully hands-off:
+
+```bash
+copilot --autopilot --allow-tool "CaseCraft" -p "Generate tests for all feature files"
+```
+
+**Custom agent** — use the CaseCraft QA agent directly:
+
+```bash
+copilot --agent=casecraft-qa -p "Generate mobile tests from features/login.txt"
+```
+
+### Customization Files
+
+The project includes Copilot CLI customization files:
+
+| File | Purpose |
+|---|---|
+| `.github/copilot-instructions.md` | Auto-loaded project context for Copilot CLI |
+| `.github/agents/casecraft-qa.md` | Custom QA agent profile with CaseCraft expertise |
+| `.github/skills/generate-tests/skill.md` | Skill definition for test generation workflow |
+| `.github/skills/query-knowledge/skill.md` | Skill definition for knowledge base queries |
+
+---
+
+## Benchmarking
+
+CaseCraft includes a built-in throughput benchmark tool for comparing locally available Ollama models:
+
+```bash
+python benchmark_models.py
+```
+
+This benchmarks all installed Ollama models and reports:
+
+- **Tokens/second** (generation and prompt processing)
+- **Time-to-first-token** (TTFT)
+- **Total response time**
+- Model metadata (parameter count, quantization level, context length)
+
+Results are printed as a sorted comparison table, making it easy to choose the fastest model for your hardware.
+
+---
+
+## Documentation
+
+The `docs/` directory contains additional architecture and design documentation:
+
+| Document | Description |
+|---|---|
+| `docs/MODEL_OPTIONS.md` | Guide for alternative model choices (Llama, Qwen, Groq, llama.cpp) |
+| `docs/architecture/mcp_implementation_guide.md` | MCP server implementation details |
+| `docs/architecture/mcp_client_setup.md` | MCP client configuration guide |
+| `docs/architecture/context_window_guide.md` | Context window sizing and tuning |
+| `docs/architecture/temperature_explained.md` | Temperature and sampling parameter guide |
+| `docs/architecture/future_improvements_explained.md` | Planned enhancements and roadmap |
+| `docs/architecture/tech_stack_analysis.md` | Technology selection rationale |
+| `docs/architecture/anythingllm_and_bitnet.md` | AnythingLLM integration analysis |
+| `docs/architecture/claude_vs_anythingllm.md` | Comparison of AI assistant platforms |
 
 ---
 

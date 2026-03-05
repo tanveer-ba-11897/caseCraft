@@ -15,45 +15,40 @@ general:
   #   "ollama"  — Local Ollama server (default)
   #   "openai"  — OpenAI / Azure OpenAI / vLLM / LocalAI
   #   "google"  — Google Gemini
-  #   "vscode"  — VS Code Copilot extension (no API key or base_url needed)
+  #   "copilot" — GitHub Models API (requires GITHUB_TOKEN with models:read scope)
   llm_provider: "ollama"
   
   # API Endpoint
   # - Ollama: http://localhost:11434
   # - OpenAI/vLLM/LocalAI: http://localhost:8000/v1
   # - Google: https://generativelanguage.googleapis.com/v1beta
-  # - vscode: leave blank (uses native vscode.lm API)
+  # - Copilot: https://models.github.ai/inference
   base_url: "http://localhost:11434"
   
   # API Key — NEVER put real keys here. Use env var CASECRAFT_GENERAL_API_KEY instead.
   # - Ollama: "ollama" (no real key needed)
-  # - vscode: leave blank (authentication via GitHub Copilot subscription)
+  # - Copilot: use env var CASECRAFT_GENERAL_API_KEY with your GITHUB_TOKEN
   api_key: "ollama"  # Default for local Ollama (no real key needed)
 
-  # Context window size (num_ctx) — controls RAM usage.
-  # -1 = auto-detect from model (recommended). Queries Ollama API.
-  # 4096 = ~4GB RAM — safe for machines with 8-16GB.
-  # 8192 = ~6GB RAM — better for larger documents.
-  context_window_size: -1
+  # Context window ratio (0.0-1.0). Fraction of model's native window to use.
+  # Auto-detected for Ollama; other providers default to 128K.
+  # 0.75 = use 75%. Lower values reduce RAM. 1.0 = full window.
+  context_window_ratio: 0.75
 
-  # Maximum context window cap — auto-detected value will never exceed this.
-  # Prevents OOM on limited-RAM machines. Set -1 to disable cap.
-  max_context_window: 8192
-
-  # Auto-detect context window from the model (Ollama only).
-  auto_detect_context_window: true
-
-  # Max output tokens. -1 = auto-scale to 25% of context window.
-  max_output_tokens: -1
-
-  # Cap for auto-scaled output tokens. Only applies when max_output_tokens is -1.
-  max_output_tokens_cap: 4096
-
-  # Fraction of context window for output (0.05-0.5). Default 0.25 = 25%.
-  output_token_ratio: 0.25
+  # Minimum guaranteed output tokens.
+  # Output allocation is dynamic: remaining context after input tokens
+  # goes to output, but never below this floor. Per-model caps are enforced
+  # automatically (see MODEL_SPECS in core/llm_client.py).
+  min_output_tokens: 1024
 
   # Maximum number of retries if the LLM generates invalid JSON.
   max_retries: 2
+
+  # Minimum seconds between consecutive LLM API calls.
+  # Prevents rate-limit (429) errors on providers with strict RPM caps.
+  # GitHub Models free tier: set to 6-8 (10 RPM cap).
+  # Ollama / local: 0 (no delay needed).
+  llm_call_delay: 0
 
 # --------------------------
 # Generation Parameters
@@ -77,6 +72,12 @@ generation:
 
   # Minimum test cases per chunk. Triggers re-generation if under this count.
   min_cases_per_chunk: 5
+
+  # Maximum parallel threads for chunk generation.
+  # Set to 1 for rate-limited providers (copilot, openai) to avoid
+  # concurrent API calls that exhaust the RPM quota instantly.
+  # 4 = good for local Ollama / unlimited APIs.
+  max_workers: 4
 
 # --------------------------
 # Output Settings
@@ -119,3 +120,27 @@ knowledge:
   query_decomposition: true   # Decompose into focused sub-queries
   query_expansion: true        # Add domain synonyms for recall
   max_sub_queries: 4           # Max sub-queries per retrieval
+
+  # Parent-Child Chunking
+  parent_child_chunking: false # Two-tier chunking: small children for search, parents for context
+  child_chunk_size: 400        # Max chars per child chunk
+  child_overlap: 50            # Overlap between adjacent children
+
+  # Knowledge Graph
+  knowledge_graph: false       # Build relation graph over chunks at ingest time
+  graph_path: "knowledge_base/knowledge_graph.json"
+  graph_max_hops: 2            # BFS hops for retrieval expansion
+  graph_max_expansion: 3       # Max graph-expanded chunks per query
+
+# --------------------------
+# Cache & Indexing
+# --------------------------
+cache:
+  enable_condensation_cache: true   # Cache LLM condensation by content hash
+  enable_retrieval_cache: true      # Cache RAG retrieval by query hash
+  enable_prompt_cache: true         # Cache rendered prompt templates
+  condensation_cache_size: 256      # Max LRU entries for condensation
+  retrieval_cache_size: 64          # Max LRU entries for retrieval
+  retrieval_cache_ttl: 300.0        # Retrieval cache TTL (seconds, 0 = no expiry)
+  prompt_cache_size: 32             # Max LRU entries for prompts
+  persist_bm25_index: true          # Persist BM25 index to disk
