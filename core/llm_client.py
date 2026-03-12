@@ -54,8 +54,9 @@ MODEL_SPECS: Dict[str, Dict[str, int]] = {
     "llama3.2:1b":  {"context_window": 131_072, "max_output": 2_048},
     "llama3.2:3b":  {"context_window": 131_072, "max_output": 4_096},
     "llama3.1:8b":  {"context_window": 131_072, "max_output": 4_096},
-    "qwen2.5:7b":   {"context_window": 131_072, "max_output": 4_096},
-    "gemma3:4b-it-q4_K_M": {"context_window": 131_072, "max_output": 4_096},
+    "llama3.3:70b": {"context_window": 131_072, "max_output": 4_096},
+    "gemma3:12b":   {"context_window": 131_072, "max_output": 8_192},
+    "gemma3:4b":    {"context_window": 131_072, "max_output": 4_096},
 }
 
 # Default max_output cap for models NOT listed in MODEL_SPECS.

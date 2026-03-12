@@ -366,7 +366,7 @@ ollama pull llama3.1:8b
 ollama pull llama3.2:3b
 
 # Best for structured output
-ollama pull qwen2.5:7b
+ollama pull gemma3:12b
 ```
 
 1. **Configure `casecraft.yaml`:**
@@ -448,7 +448,7 @@ Available models include: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o3-mini`, `
 python cli/main.py generate features/your_feature.pdf
 
 # Override model from CLI
-python cli/main.py generate features/your_feature.pdf --model qwen2.5:7b
+python cli/main.py generate features/your_feature.pdf --model gemma3:12b
 
 # Output as JSON instead of Excel
 python cli/main.py generate features/your_feature.pdf --format json
@@ -653,7 +653,7 @@ The `docs/` directory contains additional architecture and design documentation:
 
 | Document | Description |
 |---|---|
-| `docs/MODEL_OPTIONS.md` | Guide for alternative model choices (Llama, Qwen, Groq, llama.cpp) |
+| `docs/MODEL_OPTIONS.md` | Guide for alternative model choices (Llama, Gemma, Groq, llama.cpp) |
 | `docs/architecture/context_window_guide.md` | Context window sizing and tuning |
 | `docs/architecture/temperature_explained.md` | Temperature and sampling parameter guide |
 | `docs/architecture/tech_stack_analysis.md` | Technology selection rationale |

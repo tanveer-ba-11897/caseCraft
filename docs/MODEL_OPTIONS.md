@@ -7,7 +7,7 @@ This guide outlines alternatives to Llama 3.1 8B for faster or better execution 
 | If you want... | Recommended Model | Engine/Provider | Pros | Cons |
 | :--- | :--- | :--- | :--- | :--- |
 | **Maximum Speed (Local)** | **Llama 3.2 3B** | Ollama | 🚀 2-3x faster | Weaker at complex logic |
-| **Best Coding Capability** | **Qwen 2.5 7B** | Ollama | 🧠 Smarter (80% vs 72% HumanEval) | Same speed as Llama 3.1 |
+| **Best Structured Output** | **Gemma 3 12B** | Ollama | 🧠 Excellent JSON adherence, strong reasoning | Slightly more VRAM than 8B models |
 | **Blazing Speed (Cloud)** | **Llama 3.3 70B** | **Groq** | ⚡ Instant (500+ tok/s) | Free tier has rate limits |
 
 ---
@@ -30,18 +30,18 @@ Optimized for speed and edge devices.
     model: "llama3.2:3b"
   ```
 
-### Option B: Qwen 2.5 7B (Smartest)
-Often beats Llama 3.1 8B in coding benchmarks (HumanEval, LiveCodeBench).
-- **Speed**: Similar to Llama 3.1 8B (it's the same size).
-- **Quality**: Excellent. If you found Llama 3.1 "dumb", try this.
+### Option B: Gemma 3 12B (Best Structured Output)
+Google's Gemma 3 12B excels at following JSON schemas and structured reasoning tasks.
+- **Speed**: Slightly slower than 8B models due to larger size.
+- **Quality**: Excellent JSON adherence and strong reasoning. Great if Llama 3.1 produces malformed output.
 - **Setup**:
   ```bash
-  ollama pull qwen2.5:7b
+  ollama pull gemma3:12b
   ```
 - **Config (`casecraft.yaml`)**:
   ```yaml
   general:
-    model: "qwen2.5:7b"
+    model: "gemma3:12b"
   ```
 
 ---

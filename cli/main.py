@@ -10,20 +10,49 @@ from typing import Dict
 # Ensure project root is in path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.text import Text
+from rich.theme import Theme
+
 from core.generator import generate_test_suite
 from core.exporter import export
 from core.config import load_config
 
+# Shared console with custom theme
+_THEME = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "bold red",
+    "success": "bold green",
+    "muted": "dim",
+})
+console = Console(stderr=True, theme=_THEME)
+
 
 def _setup_logging(verbose: bool = False) -> None:
-    """Configure logging for the CLI. DEBUG level when --verbose, INFO otherwise."""
+    """Configure logging for the CLI using Rich for coloured, clean output."""
     level = logging.DEBUG if verbose else logging.INFO
+    handler = RichHandler(
+        console=console,
+        show_path=verbose,
+        show_time=True,
+        rich_tracebacks=True,
+        tracebacks_show_locals=verbose,
+        markup=True,
+        log_time_format="%H:%M:%S",
+    )
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(name)s: %(message)s",
         datefmt="%H:%M:%S",
-        stream=sys.stderr,
+        handlers=[handler],
     )
+
+    # Silence noisy third-party loggers (pypdf font/CMap warnings, pdfplumber, etc.)
+    for noisy in ("pypdf", "pypdf._cmap", "pypdf._page", "pdfplumber", "pdfminer", "fontTools"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 def main():
@@ -62,7 +91,7 @@ def main():
         "add-model",
         help="Register an Ollama model in MODEL_SPECS (auto-detects context window and sets output cap)",
     )
-    add_model_parser.add_argument("model", help="Ollama model name (e.g. llama3.2:1b, qwen2.5:7b)")
+    add_model_parser.add_argument("model", help="Ollama model name (e.g. llama3.2:1b, gemma3:12b)")
     add_model_parser.add_argument(
         "--max-output", type=int, default=None,
         help="Override the auto-detected max_output tokens (default: heuristic based on param count)",
@@ -87,15 +116,21 @@ def run_generate(args):
     logger = logging.getLogger("casecraft.cli")
     input_path = Path(args.file)
     if not input_path.exists():
-        logger.error("File not found: %s", input_path)
+        console.print(f"[error]File not found:[/error] {input_path}")
         sys.exit(1)
 
-    logger.info("Starting CaseCraft for %s", input_path.name)
-    # Resolve config priorities: CLI Args > Config File/Env
+    # --- Startup banner ---
     config = load_config()
-    
     model = args.model if args.model else config.general.model
     fmt_str = args.format if args.format else config.output.default_format
+
+    header = Text()
+    header.append("CaseCraft", style="bold cyan")
+    header.append("  Test Case Generator\n", style="dim")
+    header.append(f"  Document : {input_path.name}\n")
+    header.append(f"  Model    : {model}\n")
+    header.append(f"  Format   : {fmt_str}")
+    console.print(Panel(header, border_style="cyan", expand=False))
     
     # Boolean logic is tricky with argparse 'store_true' vs config
     # If args.no_dedup_semantic is True (flag passed), we want dedup=False
@@ -119,35 +154,72 @@ def run_generate(args):
         output_path = outputs_dir / f"{input_path.stem}_test_cases.{ext}"
 
     try:
-        logger.info("Parsing and generating test cases... (this may take a minute)")
+        # Rich live status spinner driven by generator's progress callback
+        from rich.status import Status
+        _status: Status | None = None
+
+        _stage_icons = {
+            "init": ":gear:",
+            "parsing": ":page_facing_up:",
+            "retrieval": ":mag:",
+            "retrieval_done": ":white_check_mark:",
+            "generating": ":robot:",
+            "post_processing": ":broom:",
+            "deduplication": ":scissors:",
+            "cross_reference": ":link:",
+            "reviewing": ":eyes:",
+            "complete": ":sparkles:",
+        }
+
+        def _on_progress(stage: str, msg: str) -> None:
+            nonlocal _status
+            icon = _stage_icons.get(stage, ":arrow_forward:")
+            if stage == "complete":
+                if _status:
+                    _status.stop()
+                    _status = None
+                console.print(f"  {icon}  {msg}", style="success")
+            else:
+                if _status is None:
+                    _status = Status(f"{icon}  {msg}", console=console, spinner="dots")
+                    _status.start()
+                else:
+                    _status.update(f"{icon}  {msg}")
+
         suite = generate_test_suite(
             str(input_path),
             model=model,
             dedup_semantic=dedup_semantic,
             reviewer_pass=reviewer_pass,
-            app_type=None  # Falls back to config
+            app_type=None,
+            progress=_on_progress,
         )
-        
-        logger.info("Generation complete. Found %d test cases.", len(suite.test_cases))
-        
-        logger.info("Exporting to %s...", output_path)
+        # Safety: ensure spinner is stopped
+        if _status:
+            _status.stop()
+
+        count = len(suite.test_cases)
+        logger.info("Exporting %d test cases to %s", count, output_path)
         export(suite, fmt_str, str(output_path))
-        
-        logger.info("Output saved to %s", output_path)
-        
+
+        # --- Summary panel ---
+        summary = Text()
+        summary.append(f"  {count}", style="bold green")
+        summary.append(" test cases generated\n")
+        summary.append(f"  Saved to ", style="dim")
+        summary.append(str(output_path), style="bold")
+        console.print(Panel(summary, title="[bold green]Done[/bold green]", border_style="green", expand=False))
+
         # Unload the model from Ollama memory to free resources
         from core.llm_client import llm_client
         llm_client.unload_model(model)
         
     except Exception as e:
-        logger.error("%s", e)
+        if _status:
+            _status.stop()
+        console.print(f"[error]Error:[/error] {e}")
         if args.verbose:
-            import traceback
-            tb = traceback.format_exc()
-            # Redact potential API keys / tokens from stack traces
-            tb = re.sub(r'(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+',
-                        r'\1=<REDACTED>', tb)
-            print(tb, file=sys.stderr)
+            console.print_exception(show_locals=True)
         sys.exit(1)
 
 

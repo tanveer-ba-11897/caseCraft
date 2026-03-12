@@ -7,7 +7,7 @@ general:
   # The Ollama model to use for generation and condensation.
   # Options:
   # - "llama3.1:8b" (Balanced)
-  # - "qwen2.5:7b" (Best Casting/Coding capability)
+  # - "gemma3:12b" (Best structured output)
   # - "llama3.2:3b" (Fastest Local)
   model: "llama3.1:8b"
 
