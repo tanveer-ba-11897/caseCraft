@@ -71,7 +71,12 @@ generation:
   app_type: "web"
 
   # Minimum test cases per chunk. Triggers re-generation if under this count.
+  # Set to 0 to disable re-generation (recommended for local CPU models).
   min_cases_per_chunk: 5
+
+  # Maximum test cases to generate per chunk.
+  # 0 = unlimited (model decides). 3-5 recommended for local CPU models.
+  max_cases_per_chunk: 0
 
   # Maximum parallel threads for chunk generation.
   # Set to 1 for rate-limited providers (copilot, openai) to avoid

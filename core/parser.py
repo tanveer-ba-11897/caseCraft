@@ -32,11 +32,61 @@ def _clean_text(text: str) -> str:
     return "\n".join(lines)
 
 
+def _format_table_as_markdown(table: list) -> str:
+    """Convert a pdfplumber table (list of rows) to markdown format."""
+    if not table or not table[0]:
+        return ""
+    rows = []
+    for row in table:
+        cells = [str(cell).strip() if cell else "" for cell in row]
+        rows.append("| " + " | ".join(cells) + " |")
+    if len(rows) >= 1:
+        # Insert separator after header row
+        header_sep = "| " + " | ".join("---" for _ in table[0]) + " |"
+        rows.insert(1, header_sep)
+    return "\n".join(rows)
+
+
 def _parse_pdf(file_path: str) -> str:
+    """Extract text and tables from a PDF using pdfplumber, with pypdf fallback."""
+    try:
+        import pdfplumber
+
+        pages_text: List[str] = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_parts: List[str] = []
+
+                # Extract tables and convert to markdown
+                tables = page.extract_tables()
+                if tables:
+                    for table in tables:
+                        md_table = _format_table_as_markdown(table)
+                        if md_table:
+                            page_parts.append(md_table)
+
+                # Extract remaining text
+                text = page.extract_text()
+                if text:
+                    page_parts.append(text)
+
+                if page_parts:
+                    pages_text.append("\n\n".join(page_parts))
+
+        if not pages_text:
+            raise DocumentParseError("No extractable text found in PDF")
+
+        return "\n".join(pages_text)
+
+    except ImportError:
+        logger.info("pdfplumber not installed, falling back to pypdf")
+    except Exception as exc:
+        logger.warning("pdfplumber extraction failed (%s), falling back to pypdf", exc)
+
+    # Fallback: pypdf basic text extraction
     try:
         reader = PdfReader(file_path)
-        pages_text: List[str] = []
-
+        pages_text = []
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
@@ -47,6 +97,8 @@ def _parse_pdf(file_path: str) -> str:
 
         return "\n".join(pages_text)
 
+    except DocumentParseError:
+        raise
     except Exception as exc:
         raise DocumentParseError(f"Failed to parse PDF: {exc}") from exc
 

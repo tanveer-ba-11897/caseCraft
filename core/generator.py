@@ -2,8 +2,8 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
-from typing import Any, Callable, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, List, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -20,6 +20,8 @@ logger = logging.getLogger("casecraft.generator")
 # Precompiled regex patterns for _clean_json_output
 _THINK_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
 _CODE_BLOCK_PATTERN = re.compile(r'```(?:json)?(.*?)```', re.DOTALL)
+# Trailing commas before ] or } (common LLM error)
+_TRAILING_COMMA = re.compile(r',\s*([\]}])')
 # Precompiled regex for _clean_test_case_titles
 _TITLE_PREFIX_PATTERN = re.compile(r'^(TC|Case|Test|Scenario|ID)\s*[-_#]?\s*\d+\s*[:\.\-]?\s*', re.IGNORECASE)
 
@@ -27,6 +29,35 @@ _TITLE_PREFIX_PATTERN = re.compile(r'^(TC|Case|Test|Scenario|ID)\s*[-_#]?\s*\d+\
 class GenerationError(Exception):
     """Raised when test case generation fails."""
     pass
+
+
+def _consolidate_small_chunks(chunks: List[str], target_size: int) -> List[str]:
+    """
+    Merge adjacent small chunks so that each consolidated chunk is close to
+    *target_size* characters.  This dramatically reduces the number of LLM
+    calls when the section-aware parser creates many tiny sections (common
+    with PDFs that have lots of headings).
+
+    Chunks that already exceed *target_size* are kept as-is.
+    """
+    if not chunks or target_size <= 0:
+        return chunks
+
+    consolidated: List[str] = []
+    buffer = chunks[0]
+
+    for chunk in chunks[1:]:
+        candidate = buffer + "\n\n" + chunk
+        if len(candidate) <= target_size:
+            buffer = candidate
+        else:
+            consolidated.append(buffer)
+            buffer = chunk
+
+    if buffer:
+        consolidated.append(buffer)
+
+    return consolidated
 
 # Thread-safe lazy loaded singletons
 _retriever = None
@@ -64,6 +95,19 @@ def get_embedder():
     return _embedder
 
 
+def _warmup_retriever() -> None:
+    """Pre-load retriever + ML models so they're ready before the first KB query.
+
+    Called from a background thread at the start of generate_test_suite().
+    Swallows all exceptions — if the KB is empty or models can't load,
+    the actual retrieval call will handle it later.
+    """
+    try:
+        get_retriever()  # triggers __init__ → background _preload_all thread
+    except Exception:
+        pass  # retrieval errors handled at call time
+
+
 
 def _compute_kb_budget() -> int:
     """
@@ -79,14 +123,14 @@ def _compute_kb_budget() -> int:
         effective_ctx          = native_window × context_window_ratio
         estimated_output       = effective_ctx × 0.25   (static fallback)
         available_input_tokens = effective_ctx - estimated_output
-        available_input_chars  = available_input_tokens × 4  (~4 chars/token)
+        available_input_chars  = available_input_tokens × CHARS_PER_TOKEN
         kb_budget              = available_input_chars - PROMPT_OVERHEAD
 
     PROMPT_OVERHEAD accounts for the generation template (~5K chars),
     the condensed feature chunk (~3K chars), and a safety margin.
     """
     from core.config import config
-    from core.llm_client import llm_client
+    from core.llm_client import llm_client, CHARS_PER_TOKEN
 
     # Use dynamic context window resolution
     ctx = llm_client.get_effective_context_window(config.general.model)
@@ -94,10 +138,12 @@ def _compute_kb_budget() -> int:
     # Static output estimate (prompt_chars=0 triggers 25% fallback)
     max_out = llm_client.get_effective_max_output_tokens(config.general.model, prompt_chars=0)
     available_tokens = max(ctx - max_out, 1024)  # floor at 1024
-    available_chars = available_tokens * 4
+    available_chars = available_tokens * CHARS_PER_TOKEN
 
     PROMPT_OVERHEAD = 10_000  # template + condensed feature + safety margin
     budget = max(available_chars - PROMPT_OVERHEAD, 5_000)
+    logger.debug("KB budget: %d chars (ctx=%d, max_out=%d, available_tok=%d, overhead=%d)",
+                 budget, ctx, max_out, available_tokens, PROMPT_OVERHEAD)
     return budget
 
 
@@ -221,31 +267,45 @@ def _retrieve_product_context(
 def _build_prompt(
     feature_chunks: List[str],
     product_context: str,
-    app_type: str = "web"
+    app_type: str = "web",
+    max_cases: int = 0,
 ) -> str:
-    return build_generation_prompt(feature_chunks, product_context, app_type)
+    return build_generation_prompt(feature_chunks, product_context, app_type, max_cases=max_cases)
+
+
+def _truncate_prompt_to_budget(prompt: str, model: str) -> str:
+    """
+    If *prompt* exceeds the model's context window (minus a minimum output
+    reserve), truncate the tail so the LLM receives a valid-length input.
+
+    The truncation is a last-resort safety net — upstream budgeting should
+    prevent this in normal operation.
+    """
+    from core.llm_client import llm_client, CHARS_PER_TOKEN
+    from core.config import config
+
+    ctx = llm_client.get_effective_context_window(model)
+    min_out = max(config.general.min_output_tokens, 256)
+    max_input_tokens = ctx - min_out
+    max_input_chars = max_input_tokens * CHARS_PER_TOKEN
+
+    if len(prompt) <= max_input_chars:
+        return prompt
+
+    overshoot = len(prompt) - max_input_chars
+    logger.warning(
+        "Prompt exceeds context budget by %d chars (%d tokens). "
+        "Truncating KB context to fit.",
+        overshoot, overshoot // CHARS_PER_TOKEN,
+    )
+    return prompt[:max_input_chars]
 
 
 
 def _condense_chunk(chunk: str, model: str) -> str:
     """
     Reduce a document chunk to concise, test relevant bullet points.
-    Uses the condensation cache to skip redundant LLM calls for
-    identical or overlapping chunk text.
     """
-    # Check condensation cache first
-    try:
-        from core.config import config as _cfg
-        if _cfg.cache.enable_condensation_cache:
-            from core.cache import get_condensation_cache
-            cache = get_condensation_cache()
-            cached = cache.get(chunk)
-            if cached is not None:
-                logger.info("Condensation cache HIT (%d chars cached)", len(cached))
-                return cached
-    except Exception:
-        pass
-
     logger.info("Condensing chunk (%d chars)... sending to LLM", len(chunk))
     prompt = build_condensation_prompt(chunk)
 
@@ -259,16 +319,7 @@ def _condense_chunk(chunk: str, model: str) -> str:
     if not condensed:
         raise GenerationError("Empty condensed chunk returned")
 
-    result = condensed.strip()
-
-    # Store in condensation cache
-    try:
-        if _cfg.cache.enable_condensation_cache:  # type: ignore[possibly-undefined]
-            cache.put(chunk, result)  # type: ignore[possibly-undefined]
-    except Exception:
-        pass
-
-    return result
+    return condensed.strip()
 
 def _normalize_test_cases(result) -> list[dict]:
     """
@@ -324,7 +375,8 @@ def _clean_json_output(text: str) -> str:
     Sanitize LLM output to ensure valid JSON.
     1. Removes <think>...</think> blocks if present.
     2. Removes markdown code blocks.
-    3. extracts the main JSON array [ ... ].
+    3. Extracts the main JSON array [ ... ].
+    4. Repairs common LLM JSON errors (trailing commas, truncated output).
     """
     # 1. Remove <think> blocks (just in case model slips into thinking mode)
     text = _THINK_PATTERN.sub('', text)
@@ -364,55 +416,304 @@ def _clean_json_output(text: str) -> str:
         end = text.rfind('}')
         if end != -1 and end > start_obj:
             text = text[start_obj : end + 1]
-            
+
+    # 4. Repair common JSON errors from small LLMs
+    text = _repair_json(text)
+
     return text.strip()
+
+
+def _escape_inner_quote(match: re.Match, text: str) -> str:
+    """
+    Determine whether a matched double-quote is a *structural* JSON quote
+    (key/value boundary) or an unescaped quote inside a string value.
+
+    Heuristic: count un-escaped quotes from the start of text up to this
+    position.  At a structural boundary the count is even (we're between
+    strings); inside a string the count is odd.  Only escape when odd.
+    """
+    pos = match.start()
+    # Count non-escaped quotes before this position
+    n_quotes = 0
+    i = 0
+    while i < pos:
+        if text[i] == '"' and (i == 0 or text[i - 1] != '\\'):
+            n_quotes += 1
+        i += 1
+    # Odd count → we're inside a string value → escape it
+    if n_quotes % 2 == 1:
+        return '\\"'
+    return '"'
+
+
+def _fix_unescaped_inner_quotes(text: str) -> str:
+    """
+    Single-pass scan that escapes double-quotes found *inside* JSON string
+    values while leaving structural quotes untouched.
+
+    Walks the string tracking whether we are inside or outside a JSON string
+    (by counting un-escaped quotes).  A quote that is inside a string *and*
+    bordered by word/space characters on both sides is treated as an
+    unescaped inner quote and replaced with \\".
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        # Handle escape sequences inside strings
+        if in_string and ch == '\\' and i + 1 < n:
+            result.append(ch)
+            result.append(text[i + 1])
+            i += 2
+            continue
+
+        if ch == '"':
+            if not in_string:
+                # Opening a string
+                in_string = True
+                result.append(ch)
+            else:
+                # Is this the real closing quote, or an unescaped inner quote?
+                # Look ahead: structural closing quotes are followed by
+                # , : ] } or whitespace (then one of those).
+                rest = text[i + 1:].lstrip()
+                if not rest or rest[0] in ',:]}\n':
+                    # Structural close
+                    in_string = False
+                    result.append(ch)
+                else:
+                    # Unescaped inner quote — escape it
+                    result.append('\\"')
+            i += 1
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _repair_json(text: str) -> str:
+    """
+    Fix common JSON syntax errors that small LLMs produce:
+    - Trailing commas before ] or }
+    - Truncated output (unbalanced brackets)
+    - Single quotes instead of double quotes (in simple cases)
+    - Unescaped double quotes inside string values
+    """
+    # Remove trailing commas: ,] or ,}
+    text = _TRAILING_COMMA.sub(r'\1', text)
+
+    # Fix unescaped double quotes inside JSON string values.
+    # E.g.  "Click the "Save" button"  →  "Click the \"Save\" button"
+    text = _fix_unescaped_inner_quotes(text)
+
+    # Fix truncated JSON: close unbalanced brackets/braces
+    # Count open vs close for [ ] and { }
+    open_sq = text.count('[')
+    close_sq = text.count(']')
+    open_br = text.count('{')
+    close_br = text.count('}')
+
+    if open_sq > close_sq or open_br > close_br:
+        # Truncated output — try to close it cleanly.
+        # Strip trailing partial content back to the last complete value
+        text = text.rstrip()
+
+        # Remove trailing incomplete key-value pairs or partial strings
+        # Find the last clean "anchor" (a complete value ending)
+        # This handles mid-string truncation like: "steps": ["Click lo
+        last_good = max(
+            text.rfind('"]'),        # end of string array
+            text.rfind('"}'),        # end of object with string value
+            text.rfind('"]),'),      # array value followed by comma (rare)
+            text.rfind('"},' ),      # object value followed by comma
+            text.rfind('}],'),       # end of array of objects
+            text.rfind('true'),      # boolean values
+            text.rfind('false'),
+            text.rfind('null'),
+        )
+
+        if last_good > 0:
+            # Advance past the anchor text to keep it
+            # Find the end of the anchor sequence
+            for end_char in (']', '}', ',', 'e', 'l'):
+                idx = text.find(end_char, last_good)
+                if idx != -1:
+                    last_good = idx + 1
+                    break
+            text = text[:last_good]
+
+        # Remove any trailing comma after truncation
+        text = text.rstrip().rstrip(',')
+
+        # Re-count and close
+        open_sq = text.count('[')
+        close_sq = text.count(']')
+        open_br = text.count('{')
+        close_br = text.count('}')
+
+        # Close braces first, then brackets (inner → outer)
+        text += '}' * (open_br - close_br)
+        text += ']' * (open_sq - close_sq)
+
+    return text
+
+
+def _parse_llm_json(raw: str, attempt_label: str) -> Optional[list]:
+    """Parse LLM output as JSON, with repair fallback. Returns parsed object or None."""
+    if not raw or not raw.strip():
+        logger.warning("Empty result string (%s)", attempt_label)
+        return None
+    raw = raw.strip()
+    cleaned = _clean_json_output(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(cleaned, return_objects=False)
+            if isinstance(repaired, str):
+                parsed = json.loads(repaired)
+            else:
+                parsed = repaired  # type: ignore[assignment]
+            logger.info("json_repair recovered malformed JSON (%s)", attempt_label)
+            return parsed  # type: ignore[return-value]
+        except Exception:
+            logger.warning("JSON parse failed (%s) | First 200 chars: %.200s", attempt_label, raw)
+            return None
 
 
 def _generate_single_suite(
     prompt: str,
     model: str,
     max_retries: int,
+    max_output_hint: int = 0,
 ) -> list[dict]:
     last_error: Exception | None = None
 
     for attempt in range(max_retries + 1):
         logger.info("Generating tests (attempt %d/%d)... sending to LLM", attempt + 1, max_retries + 1)
         try:
-            result = llm_client.generate(prompt, model, json_mode=True)
+            result = llm_client.generate(prompt, model, json_mode=True,
+                                         max_output_hint=max_output_hint,
+                                         json_array_min_items=3)
             logger.info("LLM response received (%s chars)", len(result) if isinstance(result, str) else 'parsed')
         except Exception as exc:
-            logger.debug("Generate Error: %s", exc)
+            logger.warning("LLM call failed (attempt %d): %s", attempt + 1, exc)
             last_error = exc
             continue
 
-        # Compatibility check: if result is empty string, retry
         if not result:
-            logger.debug("Empty result from LLM")
+            logger.warning("Empty result from LLM (attempt %d)", attempt + 1)
             last_error = GenerationError("Empty model output")
             continue
 
         if isinstance(result, str):
-            result = result.strip()
-            if not result:
-                logger.debug("Empty result string")
-                last_error = GenerationError("Empty model output")
+            parsed = _parse_llm_json(result, f"attempt {attempt + 1}")
+            if parsed is None:
+                last_error = GenerationError("JSON parse failed")
                 continue
-            try:
-                result = _clean_json_output(result)
-                result = json.loads(result)
-            except json.JSONDecodeError as exc:
-                logger.debug("JSON Decode Error: %s | Text: %s...", exc, result[:50])
-                last_error = exc
-                continue
+            result = parsed
 
         try:
             test_cases = _normalize_test_cases(result)
         except GenerationError as exc:
-            logger.debug("Normalization Error: %s", exc)
+            logger.warning("Normalization failed (attempt %d): %s", attempt + 1, exc)
             last_error = exc
             continue
 
-        return test_cases
+        if not test_cases:
+            logger.info("Normalization returned 0 test cases (attempt %d)", attempt + 1)
+            return test_cases
+
+        # ── Accumulation loop for small-model early-EOS ──────────────
+        # Small models (e.g. 8B) often emit 1 case and stop.  Instead of
+        # re-sending the identical prompt (which gets the same result),
+        # send a focused continuation prompt that includes the cases
+        # already generated so the model produces *different* ones.
+        _MIN_CASES_FOR_CONTINUATION = 3
+        _MAX_CONTINUATIONS = 3
+        accumulated = list(test_cases)
+
+        if len(accumulated) < _MIN_CASES_FOR_CONTINUATION:
+            logger.info("  Only %d case(s) generated — entering continuation loop (up to %d rounds)",
+                        len(accumulated), _MAX_CONTINUATIONS)
+
+        for cont_round in range(_MAX_CONTINUATIONS):
+            if len(accumulated) >= _MIN_CASES_FOR_CONTINUATION:
+                break
+
+            existing_summary = "\n".join(
+                f"  {i+1}. {c.get('test_case', 'unnamed')}" for i, c in enumerate(accumulated)
+            )
+            continuation_prompt = (
+                "You are a senior QA engineer. You already generated these test cases:\n"
+                + existing_summary
+                + "\n\nThe feature documentation needs MORE coverage. "
+                "Generate " + str(_MIN_CASES_FOR_CONTINUATION - len(accumulated))
+                + " ADDITIONAL test cases covering DIFFERENT scenarios "
+                "not listed above. Focus on: negative/error paths, boundary values, "
+                "edge cases, and alternate flows.\n\n"
+                "Return ONLY a valid JSON array of new test case objects using the "
+                "same schema as above. No markdown, no code fences.\n\n"
+                + prompt  # include original prompt for feature context
+            )
+
+            # Truncate to budget
+            continuation_prompt = _truncate_prompt_to_budget(continuation_prompt, model)
+
+            logger.info("  Continuation round %d/%d — requesting %d more case(s)...",
+                        cont_round + 1, _MAX_CONTINUATIONS,
+                        _MIN_CASES_FOR_CONTINUATION - len(accumulated))
+            try:
+                cont_result = llm_client.generate(
+                    continuation_prompt, model, json_mode=True,
+                    max_output_hint=max_output_hint,
+                )
+            except Exception as exc:
+                logger.warning("  Continuation round %d failed: %s", cont_round + 1, exc)
+                break
+
+            if not cont_result:
+                logger.warning("  Continuation round %d returned empty", cont_round + 1)
+                break
+
+            if isinstance(cont_result, str):
+                parsed = _parse_llm_json(cont_result, f"continuation {cont_round + 1}")
+                if parsed is None:
+                    break
+                cont_result = parsed
+
+            try:
+                extra_cases = _normalize_test_cases(cont_result)
+            except GenerationError:
+                logger.warning("  Continuation round %d normalization failed", cont_round + 1)
+                break
+
+            if not extra_cases:
+                logger.info("  Continuation round %d produced 0 cases — stopping", cont_round + 1)
+                break
+
+            # Deduplicate by test_case name
+            existing_names = {c.get("test_case", "").lower().strip() for c in accumulated}
+            new_cases = [c for c in extra_cases if c.get("test_case", "").lower().strip() not in existing_names]
+
+            if new_cases:
+                logger.info("  Continuation round %d added %d new case(s)", cont_round + 1, len(new_cases))
+                accumulated.extend(new_cases)
+            else:
+                logger.info("  Continuation round %d produced only duplicates — stopping", cont_round + 1)
+                break
+
+        if len(accumulated) > len(test_cases):
+            logger.info("  Accumulation complete: %d → %d cases", len(test_cases), len(accumulated))
+
+        return accumulated
 
     raise GenerationError(
         "Failed to generate valid test cases after retries."
@@ -462,26 +763,65 @@ def _process_single_chunk(
     This ensures no knowledge is lost while dramatically reducing
     the number of LLM generation calls.
     """
+    from core.config import config as _gen_cfg
     logger.info("=== Processing chunk %d ===", index + 1)
-    condensed_feature = _condense_chunk(chunk, model)
+    if _gen_cfg.generation.skip_condensation:
+        logger.info("  Skipping condensation (skip_condensation=true), using raw chunk (%d chars)", len(chunk))
+        condensed_feature = chunk
+    else:
+        condensed_feature = _condense_chunk(chunk, model)
 
-    # --- KB Condensation ---
+    # --- KB Context Preparation (no per-batch condensation) ---
+    # Skip per-batch KB condensation — it adds N extra LLM calls per chunk
+    # and the generation LLM handles raw context well enough.
+    # Just merge and batch the raw KB context within budget.
+    #
+    # Additional guard: cap total KB context at 3× the feature chunk size.
+    # A 2.7K feature chunk doesn't need 28K of KB context — that bloats
+    # the prompt, slows prompt eval on CPU, and dilutes relevance.
+    max_kb_ratio = _gen_cfg.generation.max_kb_ratio
+    kb_char_cap = len(condensed_feature) * max_kb_ratio
+
     num_raw_batches = len(product_context_batches)
     if num_raw_batches > 0 and product_context_batches != [""]:
-        logger.info("  Condensing %d KB batch(es) for chunk %d...", num_raw_batches, index + 1)
-        condensed_kb_blocks = []
-        for i, kb_batch in enumerate(product_context_batches):
-            condensed = _condense_kb_batch(kb_batch, model, i, num_raw_batches)
-            if condensed.strip():
-                condensed_kb_blocks.append(condensed)
+        budget = min(_compute_kb_budget(), kb_char_cap)
+        # Split merged KB batches back into individual context blocks
+        # so we can keep top-ranked chunks that fit within budget
+        # instead of blindly truncating mid-sentence.
+        import re as _re
+        individual_blocks: List[str] = []
+        for kb_batch in product_context_batches:
+            if not kb_batch.strip():
+                continue
+            # Each block starts with "[Context N]" — split on that boundary
+            parts = _re.split(r'(?=\[Context \d+\])', kb_batch)
+            for part in parts:
+                part = part.strip()
+                if part:
+                    individual_blocks.append(part)
 
-        # Re-batch the condensed KB (it's now much smaller)
-        if condensed_kb_blocks:
-            budget = _compute_kb_budget()
-            final_batches = _batch_context_strings(condensed_kb_blocks, budget)
-            total_condensed = sum(len(b) for b in condensed_kb_blocks)
-            logger.info("  KB condensation complete: %d raw batch(es) → %d generation batch(es) (%d chars)",
-                  num_raw_batches, len(final_batches), total_condensed)
+        # Keep only the top-ranked blocks that fit within budget.
+        # Retrieval returns blocks ranked by relevance, so we take
+        # from the front — most relevant first, least relevant dropped.
+        kept_blocks: List[str] = []
+        running_len = 0
+        dropped = 0
+        for block in individual_blocks:
+            block_cost = len(block) + (2 if kept_blocks else 0)  # "\n\n" separator
+            if running_len + block_cost <= budget:
+                kept_blocks.append(block)
+                running_len += block_cost
+            else:
+                dropped += 1
+        if dropped > 0:
+            logger.info("  KB context: kept %d/%d blocks within %d-char budget (dropped %d least relevant)",
+                        len(kept_blocks), len(individual_blocks), budget, dropped)
+
+        if kept_blocks:
+            final_batches = _batch_context_strings(kept_blocks, budget)
+            total_kb_chars = sum(len(b) for b in final_batches)
+            logger.info("  KB context: %d raw batch(es) → %d generation batch(es), %d chars (cap %d)",
+                  num_raw_batches, len(final_batches), total_kb_chars, kb_char_cap)
         else:
             final_batches = [""]
     else:
@@ -490,6 +830,25 @@ def _process_single_chunk(
     # --- Test Case Generation ---
     all_cases: List[dict] = []
     num_gen_batches = len(final_batches)
+    max_cases = _gen_cfg.generation.max_cases_per_chunk
+
+    # Estimate output tokens to tighten num_predict.
+    # Each JSON test case is roughly 300-400 tokens; add a 30% buffer
+    # for the surrounding array brackets and model overhead.
+    TOKENS_PER_CASE = 400
+    BUFFER = 1.3
+    if max_cases > 0:
+        max_output_hint = int(max_cases * TOKENS_PER_CASE * BUFFER)
+    else:
+        # No explicit cap — estimate from chunk size.
+        # Empirically ~1 test case per 500-800 chars of feature text.
+        # Use the conservative end (500) so we don't under-allocate,
+        # then add a generous 50% buffer on top.
+        CHARS_PER_CASE_ESTIMATE = 500
+        estimated_cases = max(3, len(condensed_feature) // CHARS_PER_CASE_ESTIMATE)
+        max_output_hint = int(estimated_cases * TOKENS_PER_CASE * 1.5)
+        logger.info("  No max_cases cap — estimated %d cases from %d-char chunk → output hint %d tok",
+                     estimated_cases, len(condensed_feature), max_output_hint)
 
     for batch_idx, ctx_batch in enumerate(final_batches):
         if num_gen_batches > 1:
@@ -499,13 +858,16 @@ def _process_single_chunk(
             feature_chunks=[condensed_feature],
             product_context=ctx_batch,
             app_type=app_type,
+            max_cases=max_cases,
         )
+        chunk_prompt = _truncate_prompt_to_budget(chunk_prompt, model)
 
         try:
             cases = _generate_single_suite(
                 prompt=chunk_prompt,
                 model=model,
                 max_retries=max_retries,
+                max_output_hint=max_output_hint,
             )
             all_cases.extend(cases)
         except GenerationError as exc:
@@ -533,13 +895,11 @@ def _process_single_chunk(
         )
         # Prepend instruction to generate additional/missing cases
         supplement_prompt = (
-            "IMPORTANT: The previous generation produced too few test cases. "
-            "You MUST generate MORE test cases covering additional scenarios: "
-            "negative cases, boundary values, error handling, edge cases, "
-            "input validation, state transitions, and integration points. "
-            "Generate at least " + str(min_required - len(all_cases)) + " additional unique test cases.\n\n"
+            "Generate at least " + str(min_required - len(all_cases)) + " more test cases. "
+            "Focus on: negative cases, boundary values, error handling, edge cases.\n\n"
             + supplement_prompt
         )
+        supplement_prompt = _truncate_prompt_to_budget(supplement_prompt, model)
         try:
             extra_cases = _generate_single_suite(
                 prompt=supplement_prompt,
@@ -606,21 +966,10 @@ def _generate_from_chunks(
             desc="Generating test cases",
             unit="chunk"
         )
-        # Per-chunk timeout: use configured LLM timeout + 60s buffer per chunk
-        from core.config import config as _timeout_cfg
-        chunk_timeout = _timeout_cfg.general.timeout + 60
-
         for future in pbar:
             index = future_to_index[future]
             try:
-                results_by_index[index] = future.result(timeout=chunk_timeout)
-            except FutureTimeoutError:
-                logger.warning(
-                    "Chunk %d/%d timed out after %ds. Skipping — generation continues.",
-                    index + 1, len(chunks), chunk_timeout,
-                )
-                results_by_index[index] = []
-                skipped += 1
+                results_by_index[index] = future.result()
             except Exception as exc:
                 logger.warning(
                     "Chunk %d/%d failed (%s). Skipping — generation continues.",
@@ -635,65 +984,22 @@ def _generate_from_chunks(
                 "%d/%d chunk(s) skipped due to errors.", skipped, len(chunks),
             )
 
-        # --- Retry skipped chunks sequentially (one at a time) ---
-        failed_indices = [
-            i for i in sorted(results_by_index.keys())
-            if not results_by_index[i]
-            and chunks[i].strip()  # skip genuinely empty chunks
-        ]
-        if failed_indices:
-            logger.info(
-                "Retrying %d skipped chunk(s) sequentially...",
-                len(failed_indices),
-            )
-            recovered = 0
-            for idx in failed_indices:
-                logger.info(
-                    "Retry: chunk %d/%d", idx + 1, len(chunks),
-                )
-                try:
-                    result = _process_single_chunk(
-                        idx, chunks[idx], model, max_retries,
-                        per_chunk_kb_batches[idx], app_type,
-                    )
-                    if result:
-                        results_by_index[idx] = result
-                        recovered += 1
-                        logger.info(
-                            "Retry succeeded for chunk %d (%d case(s))",
-                            idx + 1, len(result),
-                        )
-                    else:
-                        logger.warning(
-                            "Retry for chunk %d produced 0 cases. Giving up on this chunk.",
-                            idx + 1,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "Retry for chunk %d failed again (%s). Giving up on this chunk.",
-                        idx + 1, exc,
-                    )
-            if recovered:
-                logger.info(
-                    "Retry pass recovered %d/%d chunk(s).",
-                    recovered, len(failed_indices),
-                )
-
         for i in sorted(results_by_index.keys()):
             all_test_cases.extend(results_by_index[i])
 
     return all_test_cases
 
 
-def _coerce_str_list(items: Any) -> list[str]:
+def _coerce_str_list(items) -> list[str]:
     """
-    Coerce a value into a flat ``List[str]``.
+    Coerce *items* into a flat ``list[str]``.
 
-    Handles common LLM output shapes that violate the schema:
-      - plain string → single-element list
-      - list of dicts (e.g. [{"step": "…"}]) → stringify each dict's values
-      - list of mixed types → str() each
-      - non-list → empty list
+    Handles every shape LLMs actually return:
+    - ``str``              → ``[s]``
+    - ``list[str]``        → pass-through
+    - ``list[dict]``       → flatten each dict's values into one string
+    - ``list[mixed]``      → ``str()`` every element
+    - anything else        → ``[]``
     """
     if isinstance(items, str):
         return [items] if items.strip() else []
@@ -704,11 +1010,10 @@ def _coerce_str_list(items: Any) -> list[str]:
         if isinstance(item, str):
             result.append(item)
         elif isinstance(item, dict):
-            # Flatten dict values into a single string.
-            # e.g. {"step": 1, "action": "Click login"} → "1 - Click login"
-            parts = [str(v) for v in item.values() if v is not None]
+            # {"step": 1, "action": "Click"} → "step: 1, action: Click"
+            parts = [f"{k}: {v}" for k, v in item.items() if v is not None]
             if parts:
-                result.append(" - ".join(parts))
+                result.append(", ".join(parts))
         elif isinstance(item, (int, float)):
             result.append(str(item))
         # Skip other types silently
@@ -724,32 +1029,20 @@ def _sanitize_test_cases(test_cases: list[dict]) -> list[dict]:
     for case in test_cases:
         case = dict(case)  # shallow copy
 
-        # expected_results must be List[str]
-        case["expected_results"] = _coerce_str_list(case.get("expected_results", []))
-
         # Ensure required string fields have defaults
         if not case.get("use_case"):
             case["use_case"] = "General Use Case"
-            
         if not case.get("test_case"):
             case["test_case"] = "Untitled Test Case"
-            
         if not case.get("priority"):
             case["priority"] = "medium"
 
-        # actual_results must be List[str]
+        # All list[str] fields — coerce dicts/mixed types to strings
+        case["expected_results"] = _coerce_str_list(case.get("expected_results", []))
         case["actual_results"] = _coerce_str_list(case.get("actual_results", []))
-
-        # preconditions must be List[str]
         case["preconditions"] = _coerce_str_list(case.get("preconditions", []))
-
-        # steps must be List[str]
         case["steps"] = _coerce_str_list(case.get("steps", []))
-
-        # tags must be List[str]
         case["tags"] = _coerce_str_list(case.get("tags", []))
-
-        # dependencies must be List[str]
         case["dependencies"] = _coerce_str_list(case.get("dependencies", []))
 
         # test_data must be Dict[str, str]
@@ -907,6 +1200,7 @@ def _review_test_suite(
     current_json = suite.model_dump_json()
     
     prompt = build_reviewer_prompt(current_json)
+    prompt = _truncate_prompt_to_budget(prompt, model)
     
     try:
         result = llm_client.generate(prompt, model, json_mode=True)
@@ -987,6 +1281,16 @@ def generate_test_suite(
     if model is None:
         model = config.general.model
     
+    # --- Eager retriever warm-up ---
+    # Start loading ML models (SentenceTransformer, CrossEncoder, BM25)
+    # in the background BEFORE document parsing.  Document parsing for PDFs
+    # takes ~12 s; model loading takes ~7 s.  By overlapping them the user
+    # never waits for model init — it finishes while the PDF is still being
+    # parsed.
+    _progress("init", "Warming up retriever models…")
+    _warmup_thread = threading.Thread(target=_warmup_retriever, daemon=True)
+    _warmup_thread.start()
+
     # Resolve effective context window (auto-detect + cap)
     effective_ctx = llm_client.get_effective_context_window(model)
     # Static estimate (actual output tokens are computed dynamically per-call)
@@ -1005,31 +1309,54 @@ def generate_test_suite(
     )
     total_chars = sum(len(c) for c in chunks)
     logger.info("Document parsed: %d chunk(s), %d total chars", len(chunks), total_chars)
+
+    # --- Consolidate small chunks ---
+    # Section-aware parsing often creates many tiny chunks (e.g. 86 chunks
+    # averaging ~650 chars for a 56K doc).  Each chunk triggers a separate
+    # LLM call, so consolidating them to the target chunk_size cuts the
+    # number of (slow) LLM invocations dramatically.
+    original_count = len(chunks)
+    chunks = _consolidate_small_chunks(chunks, config.generation.chunk_size)
+    if len(chunks) < original_count:
+        logger.info("Consolidated %d small chunks → %d (target %d chars)",
+              original_count, len(chunks), config.generation.chunk_size)
     _progress("parsing", f"Document parsed — {len(chunks)} chunk(s), {total_chars:,} characters")
 
-    # --- Per-Chunk KB Retrieval ---
-    # Retrieve KB context separately for each feature chunk so the retriever
-    # ranks knowledge by relevance to THAT specific chunk (not the whole doc).
-    # Combined with max_kb_batches, only the most relevant context is kept.
+    # --- KB Retrieval ---
     max_kb_batches = config.quality.max_kb_batches
-    logger.info("Per-chunk KB retrieval (top_k=%s, max_kb_batches=%d)...", config.quality.top_k, max_kb_batches)
-    _progress("retrieval", f"Retrieving knowledge base context for {len(chunks)} chunk(s)…")
+    shared_kb = config.quality.shared_kb_retrieval
 
-    per_chunk_kb: List[List[str]] = []
-    total_kb_batches = 0
-    for i, chunk in enumerate(tqdm(chunks, desc="Retrieving KB context", unit="chunk")):
-        logger.debug("Retrieving KB context for chunk %d/%d...", i + 1, len(chunks))
-        batches = _retrieve_product_context(chunk)
+    if shared_kb:
+        # Single retrieval using the full document text → shared across all chunks
+        logger.info("Shared KB retrieval (top_k=%s, max_kb_batches=%d)...", config.quality.top_k, max_kb_batches)
+        _progress("retrieval", "Retrieving shared knowledge base context…")
+        doc_text = "\n".join(chunks)[:6000]  # Representative excerpt
+        shared_batches = _retrieve_product_context(doc_text)
+        if max_kb_batches > 0 and len(shared_batches) > max_kb_batches:
+            shared_batches = shared_batches[:max_kb_batches]
+        per_chunk_kb = [shared_batches] * len(chunks)
+        total_kb_batches = len(shared_batches)
+        logger.info("Shared retrieval complete: %d KB batch(es) shared across %d chunk(s)", total_kb_batches, len(chunks))
+    else:
+        # Per-chunk retrieval — more targeted but N× slower
+        logger.info("Per-chunk KB retrieval (top_k=%s, max_kb_batches=%d)...", config.quality.top_k, max_kb_batches)
+        _progress("retrieval", f"Retrieving knowledge base context for {len(chunks)} chunk(s)…")
 
-        # Apply max_kb_batches cap (batches are relevance-ordered)
-        if max_kb_batches > 0 and len(batches) > max_kb_batches:
-            logger.info("  Capping KB batches: %d → %d (most relevant)", len(batches), max_kb_batches)
-            batches = batches[:max_kb_batches]
+        per_chunk_kb: List[List[str]] = []
+        total_kb_batches = 0
+        for i, chunk in enumerate(tqdm(chunks, desc="Retrieving KB context", unit="chunk")):
+            logger.debug("Retrieving KB context for chunk %d/%d...", i + 1, len(chunks))
+            batches = _retrieve_product_context(chunk)
 
-        per_chunk_kb.append(batches)
-        total_kb_batches += len(batches)
+            # Apply max_kb_batches cap (batches are relevance-ordered)
+            if max_kb_batches > 0 and len(batches) > max_kb_batches:
+                logger.info("  Capping KB batches: %d → %d (most relevant)", len(batches), max_kb_batches)
+                batches = batches[:max_kb_batches]
 
-    logger.info("Per-chunk retrieval complete: %d total KB batch(es) across %d chunk(s)", total_kb_batches, len(chunks))
+            per_chunk_kb.append(batches)
+            total_kb_batches += len(batches)
+
+        logger.info("Per-chunk retrieval complete: %d total KB batch(es) across %d chunk(s)", total_kb_batches, len(chunks))
     _progress("retrieval_done", f"Knowledge retrieval complete — {total_kb_batches} context batch(es)")
 
     # Determine final parameters (Arg > Config)
@@ -1101,6 +1428,7 @@ def generate_test_suite(
             # Dump current suite to JSON for the prompt
             current_suite_json = json.dumps(merged_suite["test_cases"], indent=2)
             cross_ref_prompt = build_cross_reference_prompt(current_suite_json, checklist_text)
+            cross_ref_prompt = _truncate_prompt_to_budget(cross_ref_prompt, model)
             
             # Generate missing cases
             missing_cases = _generate_single_suite(
@@ -1145,13 +1473,6 @@ def generate_test_suite(
             final_suite = _review_test_suite(final_suite, model)
 
         _progress("complete", f"Done — {len(final_suite.test_cases)} test cases ready")
-
-        # Log cache performance statistics
-        try:
-            from core.cache import log_cache_stats
-            log_cache_stats()
-        except Exception:
-            pass
 
         return final_suite
     except Exception as exc:

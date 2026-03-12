@@ -24,15 +24,19 @@ class GeneralSettings(BaseModel):
     output_token_ratio: Annotated[float, Field(ge=0.0, le=1.0, description="(Deprecated — kept for backward compat) Static fallback ratio when prompt size is unknown. Dynamic allocation is preferred.")] = 0.25
     min_output_tokens: Annotated[int, Field(ge=256, description="Minimum guaranteed output tokens regardless of prompt size. Prevents the dynamic allocator from starving output when the prompt is very large.")] = 1024
     llm_call_delay: Annotated[float, Field(description="Minimum seconds between consecutive LLM API calls. Prevents rate-limit errors on providers like GitHub Models (copilot). 0 = no delay.")] = 0.0
+    num_ctx: Annotated[int, Field(ge=0, description="Ollama num_ctx override. 0 = use full effective context window (native × context_window_ratio). Positive value = pass this exact num_ctx to Ollama. Use when auto-sizing causes issues.")] = 0
 
 class GenerationSettings(BaseModel):
     chunk_size: Annotated[int, Field(description="Document chunk size")] = 1000
     chunk_overlap: Annotated[int, Field(description="Chunk overlap")] = 100
     temperature: Annotated[float, Field(description="Model temperature")] = 0.2
-    top_p: Annotated[float, Field(description="Nucleus sampling (creativity range)")] = 0.5
+    top_p: Annotated[float, Field(description="Nucleus sampling (creativity range)")] = 0.9
     app_type: Annotated[str, Field(description="Application type: web, mobile, desktop, api")] = "web"
     min_cases_per_chunk: Annotated[int, Field(description="Minimum test cases expected per chunk. Triggers re-generation if under this count.")] = 5
     max_workers: Annotated[int, Field(description="Maximum parallel threads for chunk generation. Set to 1 for rate-limited providers to avoid concurrent API calls.")] = 4
+    skip_condensation: Annotated[bool, Field(description="Skip the condensation LLM call and send raw chunks directly. Halves the LLM calls, best for small/local models where condensation is slower than just sending the full chunk.")] = False
+    max_cases_per_chunk: Annotated[int, Field(ge=0, description="Maximum test cases to generate per chunk. The LLM is instructed to stop after this many. 0 = unlimited (model decides). Lower values = faster generation on CPU (fewer output tokens). 3-5 is recommended for local models.")] = 0
+    max_kb_ratio: Annotated[int, Field(ge=1, description="Maximum KB context size as a multiple of the feature chunk size. Caps KB context to N× the (condensed) chunk length to avoid prompt bloat. Higher = more context but slower; lower = faster but less KB grounding.")] = 3
 
 class OutputSettings(BaseModel):
     default_format: Annotated[str, Field(description="Default output format (excel/json)")] = "excel"
@@ -56,18 +60,12 @@ class KnowledgeSettings(BaseModel):
 class QualitySettings(BaseModel):
     semantic_deduplication: Annotated[bool, Field(description="Enable semantic deduplication")] = True
     similarity_threshold: Annotated[float, Field(description="Similarity threshold for deduplication")] = 0.85
-    reviewer_pass: Annotated[bool, Field(description="Enable AI reviewer pass")] = False
+    reviewer_pass: Annotated[bool, Field(description="Enable AI reviewer pass")] = True
     top_k: Annotated[int, Field(description="Number of context chunks to retrieve. Set to -1 to retrieve ALL chunks.")] = 5
     max_kb_batches: Annotated[int, Field(description="Max KB context batches to process per feature chunk. Batches are ordered by relevance, so this keeps only the most useful context. Set to -1 for unlimited.")] = 10
+    shared_kb_retrieval: Annotated[bool, Field(description="Use a single KB retrieval for the whole document instead of per-chunk. Faster but less targeted context.")] = False
 
 class CacheSettings(BaseModel):
-    enable_condensation_cache: Annotated[bool, Field(description="Cache LLM condensation results by content hash. Avoids redundant LLM calls for overlapping or repeated chunks.")] = True
-    enable_retrieval_cache: Annotated[bool, Field(description="Cache RAG retrieval results by query hash. Avoids redundant hybrid search for similar queries.")] = True
-    enable_prompt_cache: Annotated[bool, Field(description="Cache rendered Jinja2 prompt templates by parameter hash.")] = True
-    condensation_cache_size: Annotated[int, Field(description="Max entries in condensation LRU cache.")] = 256
-    retrieval_cache_size: Annotated[int, Field(description="Max entries in retrieval LRU cache.")] = 64
-    retrieval_cache_ttl: Annotated[float, Field(description="TTL for retrieval cache entries in seconds. 0 = no expiry.")] = 300.0
-    prompt_cache_size: Annotated[int, Field(description="Max entries in prompt template LRU cache.")] = 32
     persist_bm25_index: Annotated[bool, Field(description="Persist BM25 sparse index to disk. Skips rebuild on startup when KB is unchanged.")] = True
 
 class CaseCraftConfig(BaseModel):

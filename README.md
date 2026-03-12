@@ -1,6 +1,11 @@
 # CaseCraft
 
-CaseCraft is an Agentic QA Engine that transforms feature requirement documents into structured, production-ready test suites. It uses local or cloud-based LLMs, Retrieval-Augmented Generation (RAG), and multiple integration interfaces — CLI and MCP Server — to generate comprehensive test cases grounded in your product's existing documentation.
+CaseCraft is an Agentic QA Engine that transforms feature requirement documents into structured, production-ready test suites. It uses local or cloud-based LLMs and Retrieval-Augmented Generation (RAG) to generate comprehensive test cases grounded in your product's existing documentation.
+
+Other documentation views:
+
+- [docs/CASECRAFT_ELIF.md](docs/CASECRAFT_ELIF.md) for a simple layman-friendly overview
+- [docs/CASECRAFT_EXECUTIVE.md](docs/CASECRAFT_EXECUTIVE.md) for a concise technical stakeholder summary
 
 ---
 
@@ -9,7 +14,7 @@ CaseCraft is an Agentic QA Engine that transforms feature requirement documents 
 ```mermaid
 sequenceDiagram
     actor User as User / AI Agent
-    participant Interface as Interface Layer (CLI / MCP)
+    participant Interface as Interface Layer (CLI)
     participant Core as Core Orchestration (generator.py)
     participant RAG as AI & Knowledge (retriever.py)
     participant VDB as ChromaDB (vector_store.py)
@@ -42,15 +47,11 @@ CaseCraft follows a modular three-tier architecture. Each layer has a clear resp
 
 ### Layer 1: Interface Layer
 
-The Interface Layer is the entry point for all interactions with CaseCraft. Whether a user runs a terminal command or an AI agent makes a tool call, this layer normalizes the request and hands it off to the Core Orchestration Layer. This separation ensures that the underlying test generation logic remains identical regardless of how CaseCraft is invoked.
+The Interface Layer is the entry point for all interactions with CaseCraft. It normalizes the request and hands it off to the Core Orchestration Layer. This separation ensures that the underlying test generation logic remains independent of how CaseCraft is invoked.
 
 **`cli/main.py`** — The primary CLI entry point. It uses Python's `argparse` to accept commands like `generate`, along with flags such as `--model`, `--format`, `--output` / `-o`, `--no-dedup-semantic`, `--reviewer` / `--quality`, and `--verbose`. It resolves configuration priority (CLI arguments override config file values, which override defaults), validates input file paths, calls `generate_test_suite()`, and exports results via `core/exporter.py`. After generation, it automatically unloads the model from Ollama memory to free resources. This is the recommended way to run CaseCraft for local usage.
 
 **`cli/ingest.py`** — The ingestion CLI for populating the RAG knowledge base. It supports four sub-commands: `sitemap` (crawl all pages from a sitemap.xml), `url` (ingest a single web page), `urls` (ingest URLs from a text file), and `docs` (ingest local PDF/TXT/MD files from a directory). Each source is parsed into `RawDocument` objects, chunked, embedded, and appended to the knowledge index.
-
-**`mcp_server/server.py`** — Exposes CaseCraft as an MCP (Model Context Protocol) server using FastMCP. It defines two tools: `generate_tests` and `query_knowledge`, which AI clients like AnythingLLM or Claude Desktop can invoke. The server implements critical security measures including path sandboxing (files must be in `features/`, `specs/`, or `docs/`), rate limiting (5-second cooldown between generation calls), input validation (app_type whitelist, query truncation), and lazy loading of heavy dependencies (PyTorch, SentenceTransformers) so that the MCP handshake completes instantly without timeout.
-
-**`casecraft_mcp.py`** — A thin wrapper script that adds the project root to `sys.path` and calls `mcp_server.server.main()`. This is the file you point your MCP client to when configuring the server.
 
 ### Layer 2: Core Orchestration Layer
 
@@ -67,7 +68,7 @@ This is the central processing engine. It manages the entire pipeline: parsing d
 7. Optionally runs a reviewer pass that sends the entire suite back to the LLM for polish.
 8. Returns a validated `TestSuite` Pydantic model.
 
-**`core/parser.py`** — Handles document ingestion. Supports PDF (via `pypdf`), plain text, and Markdown files. It extracts raw text, cleans it (strips redundant whitespace, normalizes line endings), and splits it into overlapping chunks. The chunker prefers to break at whitespace boundaries so words are never split mid-token. Enforces a 50MB file size limit to prevent memory exhaustion.
+**`core/parser.py`** — Handles document ingestion. Supports PDF, plain text, and Markdown files. PDF extraction uses a two-stage approach: **pdfplumber** is the primary extractor, providing native table extraction (`page.extract_tables()`) that converts structured tables into Markdown format alongside body text. If pdfplumber is unavailable or encounters an error, the parser falls back to **pypdf** for basic text-only extraction. This ensures tables embedded in feature documents (acceptance criteria matrices, field mappings, permission grids) are preserved as structured content rather than lost or garbled. After extraction, text is cleaned (strips redundant whitespace, normalizes line endings) and split into overlapping chunks. The chunker prefers to break at whitespace boundaries so words are never split mid-token. Enforces a 50MB file size limit to prevent memory exhaustion.
 
 **`core/prompts.py`** — Manages prompt construction using Jinja2 templates stored in `prompts/templates/`. It provides four builder functions:
 
@@ -82,11 +83,7 @@ All inputs are sanitized via `_sanitize_input()` which strips control characters
 
 **`core/config.py`** — Manages configuration loading with a three-level priority system: CLI arguments > Environment variables > YAML config file > Defaults. The config is defined as Pydantic models (`GeneralSettings`, `GenerationSettings`, `OutputSettings`, `QualitySettings`, `KnowledgeSettings`) and loaded from `casecraft.yaml`. Any setting can be overridden via environment variables using the convention `CASECRAFT_SECTION_KEY` (e.g., `CASECRAFT_GENERAL_MODEL`).
 
-**`core/exporter.py`** — Exports a `TestSuite` to Excel (`.xlsx` via openpyxl) or JSON format. Includes path traversal protection — output files must be within the configured `output_dir`. The `_join_lines()` helper safely coerces non-string items to strings before joining.
-
-**`core/cache.py`** — Thread-safe caching infrastructure with three specialised LRU caches: `CondensationCache` (caches LLM condensation results by content hash), `RetrievalCache` (caches RAG retrieval results by query hash with configurable TTL), and `PromptCache` (caches rendered Jinja2 templates by parameter hash). All caches support hit/miss stats tracking, `clear()`, and concurrent access via `threading.Lock`. BM25 disk persistence (`bm25_cache.pkl`) and secondary metadata indexes are also managed here.
-
-**`core/chunking.py`** — Shared chunking module used by both `core/parser.py` (for feature documents) and `core/knowledge/chunker.py` (for knowledge base ingestion). Provides `recursive_split()` with a separator hierarchy (`\n\n` → `\n` → `.` → `;` → `,` → ` ` → character) and section-aware splitting logic. This deduplication ensures consistent chunking behaviour across both pipelines.
+**`core/exporter.py`** — Exports a `TestSuite` to Excel (`.xlsx` via openpyxl) or JSON format. Includes path traversal protection — output files must be within the configured `output_dir`.
 
 **`core/llm_client.py`** — A unified LLM adapter that routes generation requests to one of four backends based on config:
 
@@ -138,10 +135,6 @@ Also supports **batched multi-query retrieval**: long feature texts are decompos
 
 **`core/knowledge/web_loader.py`** — Fetches content from web sources. Supports sitemap crawling (with configurable delay, max pages, and URL exclusion patterns), single URL loading, and batch URL loading from text files. Implements SSRF protection: blocks private/internal IPs, validates DNS resolution, rejects non-HTTP schemes, and limits redirect chains.
 
-**`core/knowledge/ingest.py`** — Orchestrates the full ingestion pipeline: loads documents via `loader.py` or `web_loader.py`, chunks them via `chunker.py`, embeds via `embedder.py`, stores in ChromaDB via `vector_store.py`, and optionally builds the knowledge graph via `graph.py`. Returns an `IngestResult` with chunk count, source count, and graph statistics.
-
-**`core/knowledge/integrity.py`** — SHA-256 hash-based integrity verification for the legacy `index.json` migration path. Provides `compute_hash()`, `write_hash()`, and `verify_hash()` functions to detect tampering or corruption of the flat JSON index before migrating chunks to ChromaDB.
-
 ---
 
 ## Tech Stack
@@ -151,7 +144,8 @@ Also supports **batched multi-query retrieval**: long feature texts are decompos
 | **Language** | Python 3.10+ | Core runtime for all modules |
 | **LLM Communication** | `requests` | HTTP client for Ollama, OpenAI, and Google Gemini REST APIs |
 | **Data Validation** | `pydantic` v2 | Schema enforcement for config, test cases, and LLM output |
-| **PDF Parsing** | `pypdf` | Text extraction from PDF feature documents |
+| **PDF Parsing (primary)** | `pdfplumber` | PDF text + table extraction with native table-to-Markdown conversion |
+| **PDF Parsing (fallback)** | `pypdf` | Basic text extraction from PDFs when pdfplumber is unavailable |
 | **Excel Export** | `openpyxl` | Writing structured test suites to `.xlsx` files |
 | **Configuration** | `pyyaml` | Loading `casecraft.yaml` settings |
 | **Prompt Templating** | `jinja2` | Rendering parameterized prompts for the LLM |
@@ -162,7 +156,6 @@ Also supports **batched multi-query retrieval**: long feature texts are decompos
 | **Sparse Search** | `rank-bm25` | BM25Okapi keyword scoring for hybrid search |
 | **Web Scraping** | `beautifulsoup4` | HTML-to-text extraction for web ingestion |
 | **XML Parsing** | `defusedxml` | Safe sitemap.xml parsing (prevents XXE attacks) |
-| **MCP Server** | `mcp` (FastMCP) | Model Context Protocol server for AI agent integration |
 | **Numerical** | `numpy` | Matrix operations for cosine similarity and score computation |
 | **Progress Display** | `tqdm` | Progress bars for multi-chunk generation and batch processing |
 
@@ -172,8 +165,6 @@ Also supports **batched multi-query retrieval**: long feature texts are decompos
 - **Jinja2** separates prompt logic from prompt content, making it easy to modify prompts without touching Python code.
 - **SentenceTransformers** provides high-quality local embeddings without requiring an API key or internet connection.
 - **Hybrid Search (BM25 + Dense)** catches both exact keyword matches and semantic similarities, outperforming either approach alone.
-- **FastMCP** enables zero-code integration with AI assistants like Claude Desktop and AnythingLLM.
-
 ---
 
 ## Recent Improvements
@@ -199,7 +190,6 @@ CaseCraft has been enhanced with the following features and optimizations:
 - **HTTP retry with exponential backoff**: Transient errors (429, 503, 504) trigger automatic retries with jitter
 - **Thread-safe singletons**: Retriever and embedder instances use double-checked locking
 - **Schema validation**: Priority and test_type fields are normalized and validated with `Literal` types
-- **Robust LLM output normalization**: `_coerce_str_list()` handles malformed LLM responses where list fields (steps, preconditions, expected_results) contain dicts instead of strings — e.g., `[{"step": 1, "action": "Click"}]` is flattened to `["step: 1, action: Click"]`. Mixed-type lists and bare strings are also handled gracefully
 
 ### Better User Experience
 
@@ -233,11 +223,8 @@ CaseCraft has been enhanced with the following features and optimizations:
 - **Configurable parallelism**: `max_workers` controls the number of concurrent chunk-generation threads. Set to 1 for rate-limited providers like GitHub Models free tier (10-15 RPM)
 - **Recommended copilot settings**: `max_workers: 1`, `llm_call_delay: 8` for the GitHub Models free tier
 
-### Caching & Indexing
+### Indexing & Runtime Optimisation
 
-- **Condensation cache**: LLM condensation results are cached by chunk content hash (SHA-256). When overlapping or repeated chunks appear, the cached condensation is returned without an LLM roundtrip — high-impact for large documents with chunk overlap
-- **Retrieval cache**: RAG retrieval results are cached by query + top_k hash with configurable TTL. Similar or identical queries from overlapping feature chunks reuse cached results without re-running the hybrid pipeline (dense + sparse + rerank)
-- **Prompt template cache**: Rendered Jinja2 templates are cached by parameter hash. Minor speedup, avoids redundant rendering for identical prompt parameters
 - **BM25 index persistence**: The BM25 sparse index is serialised to `bm25_cache.pkl` on first build and loaded from disk on subsequent startups — skips the full rebuild when the knowledge base hasn't changed (saves 1-5s depending on KB size)
 - **Secondary metadata indexes**: Source-file and chunk-type inverted indexes are built alongside BM25 at startup for O(1) lookup by source document or chunk type
 - **Jinja2 optimisation**: Templates are pre-compiled at module load with `auto_reload=False` — no filesystem stat checks during generation
@@ -245,7 +232,7 @@ CaseCraft has been enhanced with the following features and optimizations:
 ### Code Quality
 
 - **Shared chunking module**: Deduplicated chunking logic between parser and knowledge base
-- **168 unit tests**: Comprehensive coverage for core functions including chunking, knowledge graph construction/traversal/persistence, vector store, config loading, export, caching, prompt-injection fencing, and security
+- **167 unit tests**: Comprehensive coverage for core functions including chunking, knowledge graph construction/traversal/persistence, vector store, config loading, export, prompt-injection fencing, and security
 - **Type hints throughout**: Full type annotations for better IDE support and Pyright compliance
 
 ### Security Hardening
@@ -257,6 +244,7 @@ CaseCraft has been enhanced with the following features and optimizations:
 - **Input size limits**: JSON request lines capped at 10 MB, LLM responses at 5 MB, user text at 500K characters
 - **Sanitised errors**: Internal paths and stack traces are never exposed to users
 - **API key protection**: Keys excluded from config dumps and diagnostic output
+- **SSRF protection**: Web loader blocks private/internal IPs, validates DNS resolution, rejects non-HTTP schemes, and limits redirect chains
 
 ---
 
@@ -325,17 +313,10 @@ All settings are managed in `casecraft.yaml`. Every value can be overridden via 
 | `graph_max_hops` | `2` | Maximum BFS hops when expanding retrieval results via the knowledge graph. |
 | `graph_max_expansion` | `3` | Maximum number of graph-expanded chunks appended to retrieval results. |
 
-### Cache Settings
+### Index Persistence Settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `enable_condensation_cache` | `true` | Cache LLM condensation results by content hash. Avoids redundant LLM calls for overlapping or repeated chunks. |
-| `enable_retrieval_cache` | `true` | Cache RAG retrieval results by query hash. Avoids redundant hybrid search for similar queries. |
-| `enable_prompt_cache` | `true` | Cache rendered Jinja2 prompt templates by parameter hash. |
-| `condensation_cache_size` | `256` | Max entries in condensation LRU cache. |
-| `retrieval_cache_size` | `64` | Max entries in retrieval LRU cache. |
-| `retrieval_cache_ttl` | `300.0` | TTL for retrieval cache entries in seconds. `0` = no expiry. |
-| `prompt_cache_size` | `32` | Max entries in prompt template LRU cache. |
 | `persist_bm25_index` | `true` | Persist BM25 sparse index to disk. Skips rebuild on startup when KB is unchanged. |
 
 ---
@@ -607,147 +588,62 @@ When `app_type` is set to `mobile` in `casecraft.yaml`, CaseCraft activates mobi
 
 ---
 
-## MCP Server Configuration (Experimental)
+## Performance & Benchmarks
 
-> **Note**: MCP integration has not been fully tested. The configuration below is provided for reference.
+### Pipeline Stage Timing
 
-CaseCraft can be used as a tool by AI assistants that support the Model Context Protocol (MCP). The server exposes two tools:
+Average time per stage when processing a typical feature document (~56 KB PDF, ~10 chunks) on consumer hardware with Ollama:
 
-- **`generate_tests`** — Generates a test suite from a requirement document.
-- **`query_knowledge`** — Searches the RAG knowledge base for relevant product information.
+| Pipeline Stage | Avg Time | % of Total | Notes |
+|---|---|---|---|
+| Document parsing + chunking | ~12s | 5.7% | pdfplumber table extraction + recursive chunking |
+| ML model loading | ~7s | 3.4% | SentenceTransformer embedder + CrossEncoder reranker (first run only) |
+| KB retrieval (hybrid search) | ~4s | 2.1% | Dense + BM25 + re-ranking over ~3,000 indexed chunks |
+| Prompt building | <0.01s | ~0% | Jinja2 template rendering |
+| LLM generation (per chunk) | ~189s | 88.8% | Single LLM call — the dominant bottleneck |
+| JSON parse + sanitize | <0.01s | ~0% | With json-repair for malformed responses |
+| Semantic deduplication | <0.01s | ~0% | Embedding similarity comparison |
+| **Full pipeline (1 chunk)** | **~213s (3.5 min)** | | |
+| **Full pipeline (10 chunks, 4 workers)** | **~20–32 min** | | Parallel chunk processing with ThreadPoolExecutor |
 
-### Setup for Claude Desktop
+> **Bottleneck**: LLM generation accounts for ~89% of total pipeline time. Use a faster model or cloud provider to reduce end-to-end duration.
 
-Add to your `claude_desktop_config.json`:
+### Model Benchmark Results
 
-```json
-{
-  "mcpServers": {
-    "casecraft": {
-      "command": "python",
-      "args": ["c:\\path\\to\\casecraft\\casecraft_mcp.py"],
-      "timeout": 600
-    }
-  }
-}
-```
+Full pipeline benchmarks across 9 locally hosted Ollama models, generating test cases from the same feature document:
 
-### Setup for AnythingLLM
+| Model | Total Time | Test Cases | Quality Score | JSON Repairs |
+|---|---|---|---|---|
+| **llama3.2:3b** | 20.3 min | **52** | **0.98** | 4 |
+| llama3.1:8b | 25.8 min | 39 | 0.96 | 2 |
+| ministral-3:3b | 24.1 min | 37 | 0.95 | 7 |
+| ministral-3:8b | 40.5 min | 34 | 0.93 | 7 |
+| granite3.3:8b | 22.6 min | 29 | 0.93 | 1 |
+| granite4:3b | 19.8 min | 27 | 0.91 | 0 |
+| llama3.2:1b | 14.4 min | 18 | 0.97 | 6 |
+| granite3.3:2b | 12.7 min | 12 | 0.97 | 0 |
+| gemma3:4b | 13.8 min | 11 | 0.92 | 0 |
 
-1. Go to Agent Configuration in AnythingLLM.
-2. Add a new MCP server with:
-   - **Command**: `python`
-   - **Args**: `c:\path\to\casecraft\casecraft_mcp.py`
-3. Ensure AnythingLLM is in **Agent** mode (not Chat mode).
-4. Prompt the agent:
-   > "Use the generate_tests tool to create test cases for features/your_feature.pdf"
+**Quality score** (0.0–1.0) is computed from: steps (30%), expected results (25%), preconditions (15%), test data (15%), and title quality (15%).
 
-### Security
+**Key takeaways**:
 
-The MCP server enforces:
+- **Best overall**: `llama3.2:3b` — highest test case count (52) with top quality (0.98) in ~20 minutes
+- **Fastest**: `granite3.3:2b` — finishes in ~13 minutes but produces fewer cases (12)
+- **Best quality-per-minute**: `llama3.2:1b` — 18 cases at 0.97 quality in ~14 minutes
+- **JSON reliability**: All models achieved 100% success with json-repair recovering 0–7 malformed responses per run
 
-- **Path sandboxing**: Files must be in `features/`, `specs/`, or `docs/` directories.
-- **Rate limiting**: 5-second cooldown between generation calls.
-- **Input validation**: App type whitelist, query length truncation.
-- **Lazy loading**: Heavy ML dependencies load on first tool call, not at startup.
-- **Keep-alive pings**: 15-second interval progress pings during long-running generation and query operations prevent MCP client timeouts.
-- **Dual export**: `generate_tests` always saves output in both JSON and Excel formats with timestamps.
+### Ollama Throughput Reference
 
----
+Typical throughput on consumer hardware (measured via Ollama telemetry):
 
-## GitHub Copilot CLI Integration
-
-CaseCraft integrates natively with **GitHub Copilot CLI** as an MCP server. This lets you generate test suites and query the knowledge base using natural language directly from your terminal.
-
-### Prerequisites
-
-- [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli) installed
-- Any GitHub Copilot plan (Free, Pro, Pro+, Business, Enterprise)
-- Python 3.10+ with CaseCraft dependencies installed
-
-### Setup
-
-CaseCraft is registered as an MCP server in `~/.copilot/mcp-config.json`:
-
-```json
-{
-  "mcpServers": {
-    "CaseCraft": {
-      "command": "python",
-      "args": ["c:\\path\\to\\casecraft\\casecraft_mcp.py"],
-      "env": {},
-      "timeout": 600
-    }
-  }
-}
-```
-
-Or add interactively inside Copilot CLI:
-
-```
-/mcp add
-```
-
-### Usage
-
-**Interactive mode** — navigate to the project root and run:
-
-```bash
-copilot
-```
-
-Then type prompts like:
-
-- `Generate tests for features/login_feature.txt using CaseCraft`
-- `Query the CaseCraft knowledge base for authentication requirements`
-
-**Programmatic mode** — single-shot from terminal:
-
-```bash
-copilot -p "Use CaseCraft to generate tests for features/login.txt" --allow-tool "CaseCraft"
-```
-
-**Autonomous mode** — fully hands-off:
-
-```bash
-copilot --autopilot --allow-tool "CaseCraft" -p "Generate tests for all feature files"
-```
-
-**Custom agent** — use the CaseCraft QA agent directly:
-
-```bash
-copilot --agent=casecraft-qa -p "Generate mobile tests from features/login.txt"
-```
-
-### Customization Files
-
-The project includes Copilot CLI customization files:
-
-| File | Purpose |
+| Metric | Value |
 |---|---|
-| `.github/copilot-instructions.md` | Auto-loaded project context for Copilot CLI |
-| `.github/agents/casecraft-qa.md` | Custom QA agent profile with CaseCraft expertise |
-| `.github/skills/generate-tests/skill.md` | Skill definition for test generation workflow |
-| `.github/skills/query-knowledge/skill.md` | Skill definition for knowledge base queries |
+| Prompt eval throughput | ~106,000 tok/s |
+| Generation throughput | ~16 tok/s |
+| Generation per chunk | ~2,048 tokens (~128s decode) |
 
----
-
-## Benchmarking
-
-CaseCraft includes a built-in throughput benchmark tool for comparing locally available Ollama models:
-
-```bash
-python benchmark_models.py
-```
-
-This benchmarks all installed Ollama models and reports:
-
-- **Tokens/second** (generation and prompt processing)
-- **Time-to-first-token** (TTFT)
-- **Total response time**
-- Model metadata (parameter count, quantization level, context length)
-
-Results are printed as a sorted comparison table, making it easy to choose the fastest model for your hardware.
+> Generation (token decoding) is sequential and ~6,600× slower than prompt evaluation. This is inherent to autoregressive LLMs and is the primary reason LLM generation dominates pipeline time.
 
 ---
 
@@ -758,14 +654,30 @@ The `docs/` directory contains additional architecture and design documentation:
 | Document | Description |
 |---|---|
 | `docs/MODEL_OPTIONS.md` | Guide for alternative model choices (Llama, Qwen, Groq, llama.cpp) |
-| `docs/architecture/mcp_implementation_guide.md` | MCP server implementation details |
-| `docs/architecture/mcp_client_setup.md` | MCP client configuration guide |
 | `docs/architecture/context_window_guide.md` | Context window sizing and tuning |
 | `docs/architecture/temperature_explained.md` | Temperature and sampling parameter guide |
-| `docs/architecture/future_improvements_explained.md` | Planned enhancements and roadmap |
 | `docs/architecture/tech_stack_analysis.md` | Technology selection rationale |
-| `docs/architecture/anythingllm_and_bitnet.md` | AnythingLLM integration analysis |
-| `docs/architecture/claude_vs_anythingllm.md` | Comparison of AI assistant platforms |
+
+---
+
+## Roadmap: Next Phase
+
+### Model Fine-Tuning
+
+The next evolution of CaseCraft is fine-tuning the base LLM on high-quality test case data generated and reviewed through the current pipeline. This will:
+
+- **Improve output consistency** — A fine-tuned model learns CaseCraft's exact JSON schema, field naming conventions, and expected test structure, reducing JSON repair needs and post-processing overhead.
+- **Increase domain relevance** — Training on accepted test suites from your product domain teaches the model your terminology, common workflows, and expected coverage patterns.
+- **Reduce generation time** — Fine-tuned models produce well-structured output in fewer tokens, requiring fewer retries and supplementary generation passes.
+
+### Bug-Informed Edge Case Generation
+
+CaseCraft will support ingesting historical bug reports (from Jira, Azure DevOps, or exported CSV/JSON) into the knowledge base as a dedicated source type. During test generation, the retriever will surface previously reported bugs that are relevant to the feature under test, enabling the LLM to:
+
+- **Generate regression tests** — Automatically create test cases that cover the exact conditions that caused past defects.
+- **Target human-discovered edge cases** — Bugs found by manual testers and end users represent real-world failure modes that purely generative approaches often miss. By grounding generation in actual defect history, CaseCraft produces tests that address proven pain points.
+- **Prioritise high-risk areas** — Features with a dense bug history will receive more thorough test coverage, with higher-priority test cases targeting previously defective workflows.
+- **Close the feedback loop** — As new bugs are reported and ingested, CaseCraft's knowledge base continuously improves, making each subsequent generation run more targeted and effective.
 
 ---
 

@@ -1,9 +1,11 @@
 
 import argparse
 import logging
+import re
 import sys
 import os
 from pathlib import Path
+from typing import Dict
 
 # Ensure project root is in path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -55,11 +57,29 @@ def main():
     
     generate_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
 
+    # Add-Model Command
+    add_model_parser = subparsers.add_parser(
+        "add-model",
+        help="Register an Ollama model in MODEL_SPECS (auto-detects context window and sets output cap)",
+    )
+    add_model_parser.add_argument("model", help="Ollama model name (e.g. llama3.2:1b, qwen2.5:7b)")
+    add_model_parser.add_argument(
+        "--max-output", type=int, default=None,
+        help="Override the auto-detected max_output tokens (default: heuristic based on param count)",
+    )
+    add_model_parser.add_argument(
+        "--context-window", type=int, default=None,
+        help="Override the auto-detected context window (default: from Ollama /api/show)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "generate":
         _setup_logging(verbose=getattr(args, 'verbose', False))
         run_generate(args)
+    elif args.command == "add-model":
+        _setup_logging(verbose=False)
+        run_add_model(args)
     else:
         parser.print_help()
 
@@ -123,8 +143,85 @@ def run_generate(args):
         logger.error("%s", e)
         if args.verbose:
             import traceback
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            # Redact potential API keys / tokens from stack traces
+            tb = re.sub(r'(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+',
+                        r'\1=<REDACTED>', tb)
+            print(tb, file=sys.stderr)
         sys.exit(1)
+
+
+def run_add_model(args):
+    """Register a new Ollama model in MODEL_SPECS with auto-detected or user-supplied specs."""
+    from core.llm_client import llm_client, MODEL_SPECS
+
+    model = args.model
+    logger = logging.getLogger("casecraft.cli")
+
+    # Check if already registered
+    if model in MODEL_SPECS and args.max_output is None and args.context_window is None:
+        spec = MODEL_SPECS[model]
+        print(f"Model '{model}' is already registered: context_window={spec['context_window']:,}, "
+              f"max_output={spec['max_output']:,}")
+        return
+
+    # Auto-detect from Ollama
+    try:
+        spec = llm_client.auto_register_ollama_model(model)
+    except RuntimeError as e:
+        logger.error("%s", e)
+        print(f"[ERROR] {e}")
+        print("Make sure Ollama is running and the model is pulled.")
+        sys.exit(1)
+
+    # Apply user overrides
+    if args.context_window is not None:
+        spec["context_window"] = args.context_window
+    if args.max_output is not None:
+        spec["max_output"] = args.max_output
+    MODEL_SPECS[model] = spec
+
+    print(f"Registered '{model}' in MODEL_SPECS:")
+    print(f"  context_window : {spec['context_window']:,} tokens")
+    print(f"  max_output     : {spec['max_output']:,} tokens")
+
+    # Persist to llm_client.py so the spec survives restarts
+    _persist_model_spec(model, spec)
+
+
+def _persist_model_spec(model: str, spec: Dict[str, int]) -> None:
+    """Append or update a model entry in the MODEL_SPECS dict in llm_client.py."""
+    llm_client_path = Path(__file__).parent.parent / "core" / "llm_client.py"
+    source = llm_client_path.read_text(encoding="utf-8")
+
+    # Check if model already has a line in source
+    import re
+    escaped_model = re.escape(f'"{model}"')
+    pattern = re.compile(rf'^(\s*){escaped_model}\s*:\s*\{{.*\}},?\s*$', re.MULTILINE)
+    new_line_content = (
+        f'    "{model}": '
+        f'{{"context_window": {spec["context_window"]:_}, "max_output": {spec["max_output"]:_}}},'
+    )
+
+    match = pattern.search(source)
+    if match:
+        # Update existing entry
+        updated = source[:match.start()] + new_line_content + source[match.end():]
+    else:
+        # Insert before the closing brace of MODEL_SPECS
+        # Find the "# Ollama local models" comment or the closing "}" of MODEL_SPECS
+        ollama_marker = "    # Ollama local models\n"
+        closing_brace_idx = source.find("\n}\n", source.find("MODEL_SPECS"))
+        if closing_brace_idx == -1:
+            print("[WARN] Could not locate MODEL_SPECS closing brace — runtime-only registration.")
+            return
+
+        insert_at = closing_brace_idx
+        updated = source[:insert_at] + "\n" + new_line_content + source[insert_at:]
+
+    llm_client_path.write_text(updated, encoding="utf-8")
+    print(f"Persisted to {llm_client_path.relative_to(Path(__file__).parent.parent)}")
+
 
 if __name__ == "__main__":
     main()

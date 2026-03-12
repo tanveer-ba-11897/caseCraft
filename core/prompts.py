@@ -17,6 +17,8 @@ TEMPLATES_DIR = os.path.join(PROJECT_ROOT, "prompts", "templates")
 # auto_reload=False skips filesystem stat checks on every render —
 # templates don't change during a run so this is pure overhead.
 try:
+    # autoescape is intentionally disabled: templates render plain text for
+    # LLM prompts, not HTML.  HTML-escaping would corrupt the output.
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_DIR),
         auto_reload=False,
@@ -118,34 +120,15 @@ def _fence_injections(text: str) -> str:
 
 
 def render_template(template_name: str, **kwargs) -> str:
-    """Helper to render a template safely, with optional prompt caching."""
+    """Helper to render a template safely."""
     if not env:
         raise RuntimeError(f"Template environment not initialized. Checked {TEMPLATES_DIR}")
-
-    # Check prompt cache first
-    try:
-        from core.config import config as _cfg
-        if _cfg.cache.enable_prompt_cache:
-            from core.cache import get_prompt_cache
-            cache = get_prompt_cache()
-            cached = cache.get(template_name, **kwargs)
-            if cached is not None:
-                return cached
-    except Exception:
-        pass
 
     try:
         template = env.get_template(template_name)
         rendered = template.render(**kwargs)
     except Exception as e:
         raise RuntimeError(f"Failed to render template {template_name}: {e}")
-
-    # Store in prompt cache
-    try:
-        if _cfg.cache.enable_prompt_cache:  # type: ignore[possibly-undefined]
-            cache.put(template_name, rendered, **kwargs)  # type: ignore[possibly-undefined]
-    except Exception:
-        pass
 
     return rendered
 
@@ -173,7 +156,8 @@ def _sanitize_input(text: str, max_length: int = 500000) -> str:
 def build_generation_prompt(
     feature_chunks: List[str], 
     product_context: str,
-    app_type: str = "web"
+    app_type: str = "web",
+    max_cases: int = 0,
 ) -> str:
     """
     Constructs the main prompt for test case generation.
@@ -184,21 +168,18 @@ def build_generation_prompt(
     context_section = ""
     if product_context:
         context_section = f"""
-=== PRODUCT CONTEXT (from existing documentation) ===
-{product_context}
+=== PRODUCT CONTEXT ===
+Use this context to generate integration test cases where features interact, keep terminology consistent, and avoid contradictions.
 
-=== HOW TO USE PRODUCT CONTEXT ===
-1. Cross-reference: If the feature interacts with functionality described in the context, generate INTEGRATION test cases.
-2. Consistency: Do NOT generate test cases that contradict behaviors described in the context.
-3. Terminology: Use the same terms for shared concepts (e.g., if context calls it "checkout", do not call it "purchase flow").
-4. Gaps: If the feature document is silent on something the context covers, you may generate a test case tagged "integration" to verify the interaction.
+{product_context}
 """
 
     return render_template(
         "generation.j2",
         feature_text=joined_feature_text,
         context_section=context_section,
-        app_type=app_type
+        app_type=app_type,
+        max_cases=max_cases,
     )
 
 def build_cross_reference_prompt(existing_tests_json: str, checklist_text: str) -> str:

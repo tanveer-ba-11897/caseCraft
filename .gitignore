@@ -8,6 +8,10 @@ __pycache__/
 
 # Text files
 *.txt
+!requirements*.txt
+
+# Backup files
+*.bak
 
 # C extensions
 *.so
@@ -209,6 +213,14 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# CaseCraft project-specific
+outputs/*.xlsx
+outputs/*.json
+knowledge_base/chroma_db/
+knowledge_base/**/bm25_cache.pkl
+knowledge_base/**/bm25_cache.pkl.hmac
+casecraft.yaml
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -231,7 +243,7 @@ casecraft_config.json
 
 # Local Debug Scripts
 debug_*.py
-test_*.py
+/test_*.py
 
 # MCP & AnythingLLM configurations
 claude_desktop_config.json

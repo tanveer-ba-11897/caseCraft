@@ -50,10 +50,22 @@ MODEL_SPECS: Dict[str, Dict[str, int]] = {
     # xAI
     "xai-grok-3":      {"context_window": 131_072, "max_output": 16_384},
     "xai-grok-3-mini": {"context_window": 131_072, "max_output": 16_384},
+    # Ollama local models
+    "llama3.2:1b":  {"context_window": 131_072, "max_output": 2_048},
+    "llama3.2:3b":  {"context_window": 131_072, "max_output": 4_096},
+    "llama3.1:8b":  {"context_window": 131_072, "max_output": 4_096},
+    "qwen2.5:7b":   {"context_window": 131_072, "max_output": 4_096},
+    "gemma3:4b-it-q4_K_M": {"context_window": 131_072, "max_output": 4_096},
 }
 
-# Approximate characters per token (used to estimate input tokens from prompt length)
-CHARS_PER_TOKEN = 4
+# Default max_output cap for models NOT listed in MODEL_SPECS.
+# Prevents runaway generation when the model lacks a hard ceiling.
+DEFAULT_MAX_OUTPUT = 4_096
+
+# Approximate characters per token (used to estimate input tokens from prompt length).
+# Conservative (3) to avoid underestimating token counts for structured prompts
+# with JSON, whitespace, and special characters — prevents num_ctx truncation.
+CHARS_PER_TOKEN = 3
 
 # ── GitHub Models (Copilot) ────────────────────────────────────────────────
 # When llm_provider is "copilot", requests go through GitHub's Models API.
@@ -97,6 +109,7 @@ class LLMClient:
         self.api_key = config.general.api_key.get_secret_value()
         self.timeout = config.general.timeout
         self._resolved_context_window: Optional[int] = None
+        self._effective_context_window: Optional[int] = None
         
         # Retry configuration (could be moved to config if needed)
         self.max_retries = 3
@@ -276,12 +289,16 @@ class LLMClient:
         effective = native_window × context_window_ratio
 
         The result is floored at 2048 tokens to ensure a usable minimum.
+        Cached after first computation to avoid redundant log spam.
         """
+        if self._effective_context_window is not None:
+            return self._effective_context_window
         native = self.detect_native_context_window(model)
         ratio = max(0.01, min(config.general.context_window_ratio, 1.0))
         effective = max(int(native * ratio), 2048)
         logger.info("Effective context window: %d tokens (%.0f%% of %d native)",
                      effective, ratio * 100, native)
+        self._effective_context_window = effective
         return effective
 
     def get_effective_max_output_tokens(self, model: str, prompt_chars: int = 0) -> int:
@@ -302,12 +319,15 @@ class LLMClient:
         ctx = self.get_effective_context_window(model)
         min_out = max(config.general.min_output_tokens, 256)
 
+        # Use a quieter log level for static/repeated calls to reduce log noise
+        _log = logger.info if prompt_chars > 0 else logger.debug
+
         if prompt_chars > 0:
             # Dynamic: allocate remaining budget to output after input
             estimated_input_tokens = prompt_chars // CHARS_PER_TOKEN
             budget = ctx - estimated_input_tokens
-            logger.info("Dynamic token allocation: %d ctx - %d est. input = %d raw output budget",
-                        ctx, estimated_input_tokens, budget)
+            _log("Dynamic token allocation: %d ctx - %d est. input = %d raw output budget",
+                 ctx, estimated_input_tokens, budget)
         else:
             # Static fallback (25% of effective ctx)
             budget = int(ctx * 0.25)
@@ -315,15 +335,26 @@ class LLMClient:
         # Floor at min_output_tokens
         budget = max(budget, min_out)
 
-        # Cap at model-specific ceiling if known
+        # Cap at model-specific ceiling for ALL providers.
+        # Without a cap, Ollama's num_predict gets the entire remaining budget
+        # (e.g. 77K tokens for a small prompt against a 78K window), which
+        # bloats the KV cache and cripples CPU throughput even though the
+        # model stops at EOS naturally.
         spec = MODEL_SPECS.get(model)
-        if spec and budget > spec["max_output"]:
-            logger.info("Clamping output tokens from %d to %d (model cap for '%s')",
-                        budget, spec["max_output"], model)
-            budget = spec["max_output"]
+        if spec:
+            cap = spec["max_output"]
+        else:
+            cap = DEFAULT_MAX_OUTPUT
+            logger.warning("Model '%s' not in MODEL_SPECS — applying default max_output cap of %d. "
+                           "Use 'python -m cli.main add-model %s' to register it.",
+                           model, cap, model)
+        if budget > cap:
+            _log("Clamping output tokens from %d to %d (cap for '%s')",
+                 budget, cap, model)
+            budget = cap
 
-        logger.info("Effective max_output_tokens: %d (ctx=%d, prompt_chars=%d, min=%d)",
-                     budget, ctx, prompt_chars, min_out)
+        _log("Effective max_output_tokens: %d (ctx=%d, prompt_chars=%d, min=%d)",
+             budget, ctx, prompt_chars, min_out)
         return budget
 
     def _throttle(self) -> None:
@@ -347,10 +378,32 @@ class LLMClient:
                 time.sleep(remaining)
             self._last_call_time = time.monotonic()
 
-    def generate(self, prompt: str, model: str, json_mode: bool = False) -> str:
+    def generate(self, prompt: str, model: str, json_mode: bool = False,
+                 max_output_hint: int = 0,
+                 json_array_min_items: int = 0) -> str:
         """
         Generate text completion or chat response.
+
+        Args:
+            max_output_hint: Optional soft cap on output tokens. When > 0,
+                the actual ``num_predict`` / ``max_tokens`` is clamped to
+                this value *if* it is lower than the model's hard cap.
+                Callers can estimate this from ``max_cases_per_chunk``
+                (e.g. 5 cases × 400 tok/case = 2000).
+            json_array_min_items: When > 0 and using Ollama with json_mode,
+                use a JSON schema with ``minItems`` instead of plain
+                ``"format": "json"``.  This prevents the grammar from
+                allowing ``]`` (array close) until at least N objects
+                have been generated — fixing early-EOS with small models.
         """
+        # Auto-register unknown Ollama models on first call so they get
+        # proper MODEL_SPECS caps instead of the 4096 fallback.
+        if self.provider == "ollama" and model not in MODEL_SPECS:
+            try:
+                self.auto_register_ollama_model(model)
+            except Exception as e:
+                logger.warning("Auto-registration of '%s' failed: %s", model, e)
+
         prompt_len = len(prompt)
         logger.info("Sending request to %s (%d chars, json_mode=%s, timeout=%ds)...",
               self.provider, prompt_len, json_mode, self.timeout)
@@ -361,7 +414,8 @@ class LLMClient:
         start_time = time.time()
         try:
             if self.provider == "ollama":
-                result = self._generate_ollama(prompt, model, json_mode)
+                result = self._generate_ollama(prompt, model, json_mode, max_output_hint,
+                                               json_array_min_items=json_array_min_items)
             elif self.provider == "openai":
                 result = self._generate_openai_compatible(prompt, model, json_mode)
             elif self.provider == "google":
@@ -378,16 +432,50 @@ class LLMClient:
             logger.error("Request failed after %.1fs: %s", elapsed, e)
             raise
 
-    def _generate_ollama(self, prompt: str, model: str, json_mode: bool) -> str:
+    @staticmethod
+    def _is_reasoning_model(model: str) -> bool:
+        """Check if a model is a reasoning model that generates <think> blocks."""
+        name = model.lower()
+        return any(tag in name for tag in ("deepseek-r1", "r1:", "r1-", "/r1"))
+
+    def _generate_ollama(self, prompt: str, model: str, json_mode: bool,
+                         max_output_hint: int = 0,
+                         json_array_min_items: int = 0) -> str:
         """
-        Native Ollama API (/api/generate).
+        Native Ollama API (/api/generate) with streaming progress.
+
+        Uses ``stream: true`` so the user sees periodic progress updates
+        instead of a frozen terminal for 5+ minutes.  The full response
+        text is accumulated and returned as before.
         """
         url = f"{self.base_url}/api/generate"
         effective_max_out = self.get_effective_max_output_tokens(model, prompt_chars=len(prompt))
+
+        # Apply caller's hint (e.g. from max_cases_per_chunk) if tighter
+        if max_output_hint > 0 and max_output_hint < effective_max_out:
+            logger.info("Applying max_output_hint: %d → %d tokens", effective_max_out, max_output_hint)
+            effective_max_out = max_output_hint
+
+        # Reasoning models (DeepSeek-R1, etc.) generate <think> blocks that
+        # consume output tokens before producing useful content.  Ollama strips
+        # the think blocks from the response, so if num_predict is too small the
+        # model spends all tokens thinking and returns empty output.
+        # Multiply the budget so enough tokens remain after the thinking phase.
+        is_reasoning = self._is_reasoning_model(model)
+        if is_reasoning:
+            REASONING_MULTIPLIER = 4
+            boosted = effective_max_out * REASONING_MULTIPLIER
+            # Respect the effective context window as an upper bound
+            effective_ctx = self.get_effective_context_window(model)
+            estimated_input = len(prompt) // CHARS_PER_TOKEN
+            ceiling = max(effective_ctx - estimated_input, effective_max_out)
+            effective_max_out = min(boosted, ceiling)
+            logger.info("Reasoning model detected — boosted num_predict to %d", effective_max_out)
+
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": config.generation.temperature,
                 "top_p": config.generation.top_p,
@@ -395,18 +483,110 @@ class LLMClient:
             }
         }
 
-        # Set effective context window (auto-detected × context_window_ratio)
+        # num_ctx: auto-size to actual request needs for best throughput.
+        # Ollama pre-allocates the KV cache to num_ctx, so oversizing it
+        # wastes memory and *cripples* CPU throughput — attention cost
+        # scales linearly with context length at every decoding step.
+        # Example: 78K num_ctx → ~80 s/token; 4K num_ctx → ~0.2 s/token.
+        explicit_num_ctx = config.general.num_ctx
         effective_ctx = self.get_effective_context_window(model)
-        payload["options"]["num_ctx"] = effective_ctx
-        
-        if json_mode:
-            payload["format"] = "json"
+        if explicit_num_ctx > 0:
+            optimal_ctx = explicit_num_ctx
+            logger.info("num_ctx from config: %d", optimal_ctx)
+        else:
+            estimated_input = len(prompt) // CHARS_PER_TOKEN
+            # Use the *actual* num_predict (effective_max_out) rather than
+            # the model's spec max_output.  effective_max_out already
+            # incorporates max_output_hint, so num_ctx stays tight to
+            # the real KV-cache need — smaller context = faster CPU decode.
+            output_alloc = effective_max_out
+            raw_ctx = int((estimated_input + output_alloc) * 1.1)
+            raw_ctx = max(2048, min(raw_ctx, effective_ctx))
+            # Snap to bucket so consecutive calls reuse Ollama's KV cache.
+            # Changing num_ctx between calls forces a full model reload
+            # (~4-10s penalty per call).  Fixed buckets avoid this.
+            _NUM_CTX_BUCKETS = [2048, 3072, 4096, 6144, 8192, 12288,
+                                16384, 24576, 32768, 49152, 65536, 131072]
+            optimal_ctx = raw_ctx
+            for bucket in _NUM_CTX_BUCKETS:
+                if bucket >= raw_ctx:
+                    optimal_ctx = bucket
+                    break
+            optimal_ctx = min(optimal_ctx, effective_ctx)
+            logger.info("num_ctx auto-sized to %d (raw %d, input~%d tok + output=%d tok)",
+                        optimal_ctx, raw_ctx, estimated_input, output_alloc)
+        payload["options"]["num_ctx"] = optimal_ctx
 
-        response = self._request_with_retry(
-            "post", url, "Ollama",
-            json=payload, timeout=self.timeout, verify=True
+        if json_mode:
+            if json_array_min_items > 0:
+                # Use a JSON schema so the grammar requires at least N items
+                # before ] becomes a valid token — prevents small models from
+                # closing the array after just 1 object.
+                payload["format"] = {
+                    "type": "array",
+                    "minItems": json_array_min_items,
+                    "items": {"type": "object"},
+                }
+                logger.info("Using JSON schema with minItems=%d", json_array_min_items)
+            else:
+                payload["format"] = "json"
+
+        # --- Streaming request ---
+        import json as _json
+
+        response = requests.post(
+            url, json=payload, timeout=self.timeout, stream=True, verify=True,
         )
-        return response.json().get("response", "")
+        response.raise_for_status()
+
+        chunks: list[str] = []
+        token_count = 0
+        last_log_time = time.time()
+        _PROGRESS_INTERVAL = 10  # log progress every N seconds
+        prompt_eval_count = 0
+        prompt_eval_duration = 0
+        eval_count_total = 0
+        eval_duration_total = 0
+
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+            try:
+                chunk_data = _json.loads(raw_line)
+            except _json.JSONDecodeError:
+                continue
+
+            token_text = chunk_data.get("response", "")
+            if token_text:
+                chunks.append(token_text)
+                token_count += 1
+
+            # Periodic progress logging so the user knows it's alive
+            now = time.time()
+            if now - last_log_time >= _PROGRESS_INTERVAL:
+                logger.info("  ...generating: %d tokens so far (%.0fs elapsed)",
+                            token_count, now - (last_log_time - _PROGRESS_INTERVAL + _PROGRESS_INTERVAL))
+                last_log_time = now
+
+            # Final chunk contains the telemetry
+            if chunk_data.get("done", False):
+                prompt_eval_count = chunk_data.get("prompt_eval_count", 0)
+                prompt_eval_duration = chunk_data.get("prompt_eval_duration", 0)
+                eval_count_total = chunk_data.get("eval_count", 0)
+                eval_duration_total = chunk_data.get("eval_duration", 0)
+                break
+
+        result_text = "".join(chunks)
+
+        # Log Ollama's native performance telemetry
+        if eval_duration_total > 0:
+            gen_tps = eval_count_total / (eval_duration_total / 1e9)
+            logger.info("Ollama stats: %d prompt tok (%.1f tok/s), %d gen tok (%.1f tok/s), num_ctx=%d",
+                        prompt_eval_count,
+                        prompt_eval_count / (prompt_eval_duration / 1e9) if prompt_eval_duration > 0 else 0,
+                        eval_count_total, gen_tps, optimal_ctx)
+
+        return result_text
 
     def _generate_openai_compatible(self, prompt: str, model: str, json_mode: bool) -> str:
         """
@@ -566,6 +746,56 @@ class LLMClient:
         if "choices" in data and len(data["choices"]) > 0:
             return data["choices"][0]["message"]["content"]
         return ""
+
+    def auto_register_ollama_model(self, model: str) -> Dict[str, int]:
+        """
+        Query Ollama for a model's specs and register it in MODEL_SPECS at runtime.
+
+        Auto-detects context_window from Ollama's /api/show endpoint.
+        Sets max_output based on model size heuristics:
+          - <2B params  → 2,048
+          - <10B params → 4,096
+          - ≥10B params → 8,192
+
+        Returns the spec dict that was registered.
+        Raises RuntimeError if the model cannot be queried.
+        """
+        if model in MODEL_SPECS:
+            logger.info("Model '%s' already in MODEL_SPECS.", model)
+            return MODEL_SPECS[model]
+
+        url = f"{self.base_url}/api/show"
+        try:
+            response = requests.post(url, json={"name": model}, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError(f"Cannot query Ollama for model '{model}': {e}")
+
+        data = response.json()
+        model_info = data.get("model_info", {})
+
+        # Detect context_window
+        context_window = 0
+        for key, value in model_info.items():
+            if "context_length" in key.lower():
+                context_window = int(value)
+                break
+        if context_window <= 0:
+            context_window = 8_192  # safe fallback
+
+        # Detect parameter count for max_output heuristic
+        param_count = model_info.get("general.parameter_count", 0)
+        if param_count and param_count < 2_000_000_000:
+            max_output = 2_048
+        elif param_count and param_count < 10_000_000_000:
+            max_output = 4_096
+        else:
+            max_output = 8_192
+
+        spec = {"context_window": context_window, "max_output": max_output}
+        MODEL_SPECS[model] = spec
+        logger.info("Registered '%s' in MODEL_SPECS: %s", model, spec)
+        return spec
 
     def unload_model(self, model: str) -> bool:
         """

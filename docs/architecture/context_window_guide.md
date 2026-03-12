@@ -48,6 +48,7 @@ Hard limits from each provider. CaseCraft enforces these automatically:
 ### Configuration
 
 In `casecraft.yaml`:
+
 ```yaml
 general:
   context_window_ratio: 0.75  # 75% of native window
@@ -55,6 +56,7 @@ general:
 ```
 
 Or via environment variables:
+
 ```powershell
 $env:CASECRAFT_GENERAL_CONTEXT_WINDOW_RATIO=0.5
 $env:CASECRAFT_GENERAL_MIN_OUTPUT_TOKENS=2048

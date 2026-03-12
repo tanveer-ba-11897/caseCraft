@@ -11,6 +11,8 @@ Init is near-instant (~0.05 s) because ChromaDB persists on disk and
 ML models are loaded in a background thread.
 """
 
+import hashlib
+import hmac
 import logging
 import os
 import pickle
@@ -208,6 +210,56 @@ class KnowledgeRetriever:
                 ) from exc
             self._models_loaded = True
 
+    # -- BM25 pickle HMAC helpers --------------------------------------
+
+    @staticmethod
+    def _bm25_hmac_path(cache_path: Path) -> Path:
+        """Return the sibling HMAC file path for the BM25 pickle cache."""
+        return cache_path.with_suffix(".pkl.hmac")
+
+    @staticmethod
+    def _compute_file_hmac(file_path: Path) -> str:
+        """Compute HMAC-SHA256 of *file_path* using a machine-local key."""
+        # Key derived from the absolute path of the cache directory.
+        # This is NOT cryptographic secret management — it simply ensures
+        # the pickle wasn't tampered with by an external actor who does
+        # not have filesystem write access to the sibling .hmac file.
+        key = hashlib.sha256(
+            str(file_path.parent.resolve()).encode()
+        ).digest()
+        h = hmac.new(key, digestmod=hashlib.sha256)
+        with open(file_path, "rb") as f:
+            while True:
+                block = f.read(65_536)
+                if not block:
+                    break
+                h.update(block)
+        return h.hexdigest()
+
+    def _write_bm25_hmac(self) -> None:
+        """Write the HMAC tag for the current BM25 pickle file."""
+        if not self._bm25_cache_path.exists():
+            return
+        tag = self._compute_file_hmac(self._bm25_cache_path)
+        hmac_path = self._bm25_hmac_path(self._bm25_cache_path)
+        hmac_path.write_text(tag, encoding="utf-8")
+
+    def _verify_bm25_hmac(self) -> bool:
+        """Return True if the BM25 pickle HMAC matches, False otherwise."""
+        hmac_path = self._bm25_hmac_path(self._bm25_cache_path)
+        if not hmac_path.exists():
+            logger.warning("BM25 HMAC file missing, cache will be rebuilt")
+            return False
+        try:
+            stored = hmac_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        actual = self._compute_file_hmac(self._bm25_cache_path)
+        if not hmac.compare_digest(stored, actual):
+            logger.warning("BM25 cache HMAC mismatch — possible tampering, rebuilding")
+            return False
+        return True
+
     def _ensure_bm25_built(self) -> None:
         if self._bm25_built:
             return
@@ -226,35 +278,38 @@ class KnowledgeRetriever:
 
             _BM25_LOAD_TIMEOUT = 120  # seconds
             if persist_enabled and self._bm25_cache_path.exists():
-                try:
-                    import concurrent.futures
-                    def _load_pickle(path):
-                        with open(path, "rb") as f:
-                            return pickle.load(f)
-                    with concurrent.futures.ThreadPoolExecutor(1) as _pool:
-                        cached = _pool.submit(_load_pickle, self._bm25_cache_path).result(timeout=_BM25_LOAD_TIMEOUT)
-                    if cached.get("count") == current_count:
-                        self.bm25 = cached["bm25"]
-                        self._bm25_ids = cached["ids"]
-                        self._bm25_texts = cached["texts"]
-                        self._bm25_metadatas = cached["metadatas"]
-                        self._bm25_id_to_idx = cached["id_to_idx"]
-                        self._source_index = cached.get("source_index", {})
-                        self._type_index = cached.get("type_index", {})
-                        logger.info(
-                            "BM25 index loaded from cache: %d docs (%.1f KB)",
-                            current_count,
-                            self._bm25_cache_path.stat().st_size / 1024,
-                        )
-                        self._bm25_built = True
-                        return
-                    else:
-                        logger.info(
-                            "BM25 cache stale (cached=%d, current=%d), rebuilding",
-                            cached.get("count", 0), current_count,
-                        )
-                except Exception as e:
-                    logger.debug("BM25 cache load failed: %s, rebuilding", e)
+                if not self._verify_bm25_hmac():
+                    logger.info("BM25 cache rejected (HMAC), will rebuild from scratch")
+                else:
+                    try:
+                        import concurrent.futures
+                        def _load_pickle(path):
+                            with open(path, "rb") as f:
+                                return pickle.load(f)
+                        with concurrent.futures.ThreadPoolExecutor(1) as _pool:
+                            cached = _pool.submit(_load_pickle, self._bm25_cache_path).result(timeout=_BM25_LOAD_TIMEOUT)
+                        if cached.get("count") == current_count:
+                            self.bm25 = cached["bm25"]
+                            self._bm25_ids = cached["ids"]
+                            self._bm25_texts = cached["texts"]
+                            self._bm25_metadatas = cached["metadatas"]
+                            self._bm25_id_to_idx = cached["id_to_idx"]
+                            self._source_index = cached.get("source_index", {})
+                            self._type_index = cached.get("type_index", {})
+                            logger.info(
+                                "BM25 index loaded from cache: %d docs (%.1f KB)",
+                                current_count,
+                                self._bm25_cache_path.stat().st_size / 1024,
+                            )
+                            self._bm25_built = True
+                            return
+                        else:
+                            logger.info(
+                                "BM25 cache stale (cached=%d, current=%d), rebuilding",
+                                cached.get("count", 0), current_count,
+                            )
+                    except Exception as e:
+                        logger.debug("BM25 cache load failed: %s, rebuilding", e)
 
             # --- Build from scratch ---
             try:
@@ -312,6 +367,7 @@ class KnowledgeRetriever:
                             self._bm25_cache_path,
                             self._bm25_cache_path.stat().st_size / 1024,
                         )
+                        self._write_bm25_hmac()
                     except Exception as e:
                         logger.debug("BM25 cache write failed: %s", e)
 
@@ -356,23 +412,6 @@ class KnowledgeRetriever:
         top_k: int = 5,
         filters: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
-        # Check retrieval cache (only for unfiltered queries)
-        _use_cache = False
-        _retrieval_cache = None
-        if not filters:
-            try:
-                from core.config import config as _app_cfg
-                if _app_cfg.cache.enable_retrieval_cache:
-                    from core.cache import get_retrieval_cache
-                    _retrieval_cache = get_retrieval_cache()
-                    cached = _retrieval_cache.get(query_text, top_k)
-                    if cached is not None:
-                        logger.debug("Retrieval cache HIT (%d results)", len(cached))
-                        return cached
-                    _use_cache = True
-            except Exception:
-                pass
-
         self._ensure_models_loaded()
         self._ensure_bm25_built()
 
@@ -450,10 +489,6 @@ class KnowledgeRetriever:
         # 4. Re-ranking
         results = self._rerank_and_build(candidate_items, query_text, top_k, retrieve_all)
 
-        # Store in retrieval cache
-        if _use_cache and _retrieval_cache is not None:
-            _retrieval_cache.put(query_text, top_k, results)
-
         return results
 
     # -- Multi-query batched retrieval ---------------------------------
@@ -468,23 +503,6 @@ class KnowledgeRetriever:
         max_sub_queries: int = 4,
     ) -> List[KnowledgeChunk]:
         """Batched multi-query retrieval with query transforms."""
-        # Check retrieval cache (only for unfiltered queries)
-        _use_cache = False
-        _retrieval_cache = None
-        if not filters:
-            try:
-                from core.config import config as _app_cfg
-                if _app_cfg.cache.enable_retrieval_cache:
-                    from core.cache import get_retrieval_cache
-                    _retrieval_cache = get_retrieval_cache()
-                    cached = _retrieval_cache.get(feature_text, top_k)
-                    if cached is not None:
-                        logger.debug("Multi-query retrieval cache HIT (%d results)", len(cached))
-                        return cached
-                    _use_cache = True
-            except Exception:
-                pass
-
         self._ensure_models_loaded()
         self._ensure_bm25_built()
 
@@ -592,10 +610,6 @@ class KnowledgeRetriever:
         results = self._rerank_and_build(
             candidate_items, feature_text[:1500], top_k, retrieve_all,
         )
-
-        # Store in retrieval cache
-        if _use_cache and _retrieval_cache is not None:
-            _retrieval_cache.put(feature_text, top_k, results)
 
         return results
 
