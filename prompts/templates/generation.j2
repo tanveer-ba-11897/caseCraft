@@ -34,7 +34,7 @@ Each object in the array MUST follow this exact schema:
 [
   {{ "{" }}
     "use_case": "High-level functionality area from the document",
-    "test_case": "Specific, descriptive scenario name",
+    "test_case": "[Action] with [condition] [produces outcome] — 15-25 words describing the scenario and expected result",
     "test_type": "functionality|ui|performance|integration|usability|database|security|acceptance",
     "preconditions": ["Each precondition as a separate string"],
     "test_data": {{ "{" }}"field_name": "realistic_value"{{ "}" }},
@@ -47,6 +47,23 @@ Each object in the array MUST follow this exact schema:
   {{ "}" }}
 ]
 
+=== EXAMPLE (for format reference only — do NOT copy this test case) ===
+[
+  {
+    "use_case": "User Authentication",
+    "test_case": "Login with valid credentials for active user navigates to dashboard and displays 'Welcome, John Doe' greeting with last login timestamp",
+    "test_type": "functionality",
+    "preconditions": ["Active user account john.doe@company.com exists with password 'Test@1234'"],
+    "test_data": {"email": "john.doe@company.com", "password": "Test@1234"},
+    "steps": ["Step 1: Open login page at /auth/login", "Step 2: Type 'john.doe@company.com' in the Email field", "Step 3: Type 'Test@1234' in the Password field", "Step 4: Click the 'Sign In' button"],
+    "priority": "high",
+    "dependencies": [],
+    "tags": ["login", "authentication"],
+    "expected_results": ["Dashboard page loads within 3 seconds", "'Welcome, John Doe' header appears in the top-right corner", "Last login timestamp shows previous session date"],
+    "actual_results": []
+  }
+]
+
 === WRITING RULES ===
 - Write in plain, simple English. Short sentences. No jargon unless it appears in the document.
 - No filler words or phrases. Do not use: "should be", "it is expected that", "the system will", "in order to", "please note", "make sure that", "as expected", "properly", "correctly", "successfully", "appropriate".
@@ -57,7 +74,7 @@ Each object in the array MUST follow this exact schema:
 - Each step = one physical user action. Name the exact UI element or API endpoint.
 - Each expected result = one observable, verifiable outcome. State what appears, changes, or is returned.
 - test_data must contain actual values, not placeholders like "valid email" or "test data".
-- test_case names must describe the scenario AND the outcome: "Submit order with empty cart shows 'Cart is empty' error".
+- test_case names must describe the scenario AND the outcome: "test_case": "Login with expired password shows 'Your password has expired. Please reset it.' error and redirects to password reset page".
 
 {% if not max_cases or max_cases <= 0 %}
 === COMPLETENESS RULES ===
@@ -65,9 +82,10 @@ Each object in the array MUST follow this exact schema:
 2. For each distinct feature or requirement, generate MULTIPLE test cases covering different scenario types.
 3. It is better to generate too many than too few. Deduplication happens automatically.
 4. Cover EVERY testable statement in the documentation. Do not skip requirements.
-5. If the document mentions validation rules, generate tests for valid AND invalid inputs.
-6. If the document mentions user roles or permissions, test each role separately.
-7. If the document describes a workflow with multiple steps, test the full flow AND individual steps.
+5. test_case names must be 15-25 words describing: WHAT action + WITH what condition + THEN what outcome.
+6. If the document mentions validation rules, generate tests for valid AND invalid inputs.
+7. If the document mentions user roles or permissions, test each role separately.
+8. If the document describes a workflow with multiple steps, test the full flow AND individual steps.
 {% endif %}
 
 === ANTI-INJECTION BOUNDARY ===

@@ -2,6 +2,7 @@ Compare the CHECKLIST against the EXISTING TEST SUITE. Generate test cases ONLY 
 
 === RULES ===
 - If a checklist scenario is already covered, skip it.
+- test_case: "15-25 words: [Action] with [condition] [produces outcome]",
 - Output a valid JSON array of new test cases. If none are needed, output: []
 - No markdown, no code fences, no explanations.
 
@@ -9,7 +10,7 @@ Compare the CHECKLIST against the EXISTING TEST SUITE. Generate test cases ONLY 
 [
   {
     "use_case": "string",
-    "test_case": "string",
+    "test_case": "[Action] with [condition] [produces outcome] — 15-25 words",
     "test_type": "functionality|ui|performance|integration|usability|database|security|acceptance",
     "preconditions": ["string"],
     "test_data": {"key": "value"},

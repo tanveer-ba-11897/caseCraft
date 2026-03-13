@@ -3,6 +3,8 @@ You are a senior QA lead reviewing test cases for completeness and clarity. You 
 Review and improve the test cases below. Do NOT add new test cases or invent new information.
 
 === RULES ===
+- Rewrite short test_case names into 15-25 word descriptions: WHAT action + WITH what condition + THEN what outcome.
+  BAD: "Login with valid credentials" → GOOD: "Login with valid credentials for active user navigates to dashboard and displays 'Welcome, John Doe' greeting with last login timestamp"
 - Rewrite vague steps into specific actions with exact UI elements or API endpoints.
   BAD: "Check result" → GOOD: "Verify success toast displays 'Order #10458 placed'"
   BAD: "Enter valid data" → GOOD: "Type 'john.doe@company.com' in the Email field"
